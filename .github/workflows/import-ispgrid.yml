@@ -1,0 +1,86 @@
+name: Import pinned ISPGrid reference
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-ispgrid.yml'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - name: Download immutable upstream archive
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            'https://codeload.github.com/ispgrid/ispgrid/zip/9672149a1e7891d43e519bfacbc5993b5b60820b' \
+            -o "$RUNNER_TEMP/ispgrid.zip"
+      - name: Verify archive against supplied ZIP file manifest and stage exact bytes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, stat, subprocess, zipfile
+          expected_revision = "9672149a1e7891d43e519bfacbc5993b5b60820b"
+          expected_manifest = "8ce41da985ad398f8d42982411143757d6242fb66760870e7d1f5cd34e7055df"
+          archive = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ispgrid.zip"
+          target = pathlib.Path("ispgrid")
+          if target.exists():
+              raise SystemExit("Refusing to overwrite existing reference")
+          with zipfile.ZipFile(archive) as z:
+              if z.comment.decode("ascii") != expected_revision:
+                  raise SystemExit("Archive revision mismatch")
+              files = [i for i in z.infolist() if not i.is_dir()]
+              if len(files) != 909 or z.testzip() is not None:
+                  raise SystemExit("Archive file count or integrity mismatch")
+              seen = set()
+              rows = []
+              entries = []
+              for i in files:
+                  p = pathlib.PurePosixPath(i.filename)
+                  if p.is_absolute() or len(p.parts) < 2 or ".." in p.parts or any(c in i.filename for c in ("\\", "\n", "\r", "\t")):
+                      raise SystemExit("Unsafe archive path")
+                  rel = "/".join(p.parts[1:])
+                  if rel in seen or ".git" in p.parts or stat.S_ISLNK(i.external_attr >> 16):
+                      raise SystemExit("Duplicate or unsafe archive member")
+                  seen.add(rel)
+                  data = z.read(i)
+                  mode = "100755" if i.external_attr >> 16 & 0o111 else "100644"
+                  blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+                  rows.append((rel, f"{mode} {blob}\t{rel}\n"))
+                  entries.append((rel, mode, blob, data))
+              actual = hashlib.sha256("".join(row for _, row in sorted(rows)).encode()).hexdigest()
+              if actual != expected_manifest:
+                  raise SystemExit("Supplied ZIP manifest mismatch: " + actual)
+              for rel, mode, blob, data in entries:
+                  path = target / rel
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+                  path.chmod(0o755 if mode == "100755" else 0o644)
+                  got = subprocess.check_output(["git", "hash-object", "-w", "--no-filters", "--stdin"], input=data).decode().strip()
+                  if got != blob:
+                      raise SystemExit("Git blob identity mismatch")
+                  subprocess.run(["git", "update-index", "--add", "--cacheinfo", mode, blob, str(path)], check=True)
+          print("Verified exact contents and executable modes of 909 supplied files:", expected_manifest)
+          PY
+          git diff --cached --stat | tail -n 1
+          test "$(git diff --cached --name-only | wc -l)" -eq 909
+      - name: Record provenance and publish reviewed reference branch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("README.md")
+          s=p.read_text()
+          s=s.replace("Source snapshot: pending verified import to `ispgrid/`.", "Source snapshot: `ispgrid/`, 909 files verified against the supplied archive manifest (SHA-256 `8ce41da985ad398f8d42982411143757d6242fb66760870e7d1f5cd34e7055df`). This archive omits upstream export-ignore paths; consult the official GitHub revision for those files.")
+          p.write_text(s)
+          PY
+          git add README.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c reference/ispgrid-9672149
+          git commit -m 'Import verified ISPGrid archive at 9672149'
+          git push origin HEAD:refs/heads/reference/ispgrid-9672149
