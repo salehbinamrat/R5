@@ -1,0 +1,86 @@
+# shellcheck shell=bash
+#  Step 10: firewall, detect and don't assume. ufw active: add the rules. firewalld or other nftables/iptables
+#  rules: change nothing and print what to allow. Nothing: enable ufw, allowing SSH first.
+step "Firewall"
+
+other_rules_present() {
+  systemctl is-enabled -q netfilter-persistent 2>/dev/null && return 0
+  local ruleset
+  #  Whole outputs are read before matching: grep -q closing a pipe early fails the pipe under pipefail.
+  ruleset=$(nft list ruleset 2>/dev/null || true)
+  foreign_nft_rules "$ruleset"
+}
+
+ufw_active=no
+ufw_status=$(ufw status 2>/dev/null || true)
+if grep -q '^Status: active' <<<"$ufw_status"; then ufw_active=yes; fi
+firewalld_active=no
+systemctl is-active -q firewalld 2>/dev/null && firewalld_active=yes
+other=no
+[[ "$ufw_active" == no ]] && other_rules_present && other=yes
+note_space=" "
+mode=$(firewall_mode "$ufw_active" "$firewalld_active" "$other")
+
+ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" && !found { print $2; found = 1 }' || true)
+mapfile -t rules < <(firewall_rules "$ROUTERS" "${ssh_port:-22}" "${L2TP_SUBNET:-$ROUTER_NETWORK}" "$WG_PORT" "$ACCESS")
+
+if [[ "$mode" == other ]]; then
+  FIREWALL_NOTE="A firewall is already managed on this server ($([[ "$firewalld_active" == yes ]] && echo firewalld || echo nftables/iptables rules)); nothing was changed. Allow these ports in it (shown as ufw rules):"
+  for rule in "${rules[@]}"; do
+    FIREWALL_NOTE+=$'\n'"  ufw $rule"
+  done
+  if [[ "$ROUTERS" == l2tp ]]; then
+    FIREWALL_NOTE+=$'\n'"  and L2TP only inside IPsec: iptables -A INPUT -p udp --dport 1701 -m policy --dir in --pol ipsec -j ACCEPT"
+  fi
+  FIREWALL_NOTE+=$'\n'
+  note_space=""
+  say "$FIREWALL_NOTE"
+else
+  command -v ufw >/dev/null 2>&1 || apt_install ufw
+  for rule in "${rules[@]}"; do
+    read -r -a args <<<"$rule"
+    ufw "${args[@]}" >/dev/null
+  done
+  #  Rules from an earlier run that no longer apply (another router network, SSH port or mode) are removed; the
+  #  wanted rules are then added once more, so a rule ufw printed differently is never left deleted.
+  mapfile -t stale < <(stale_ufw_rules "$(ufw show added 2>/dev/null || true)" "${rules[@]}")
+  if (( ${#stale[@]} > 0 )); then
+    for rule in "${stale[@]}"; do
+      read -r -a args <<<"$rule"
+      ufw delete "${args[@]}" >/dev/null || warn "Could not remove the old firewall rule: ufw $rule"
+    done
+    for rule in "${rules[@]}"; do
+      read -r -a args <<<"$rule"
+      ufw "${args[@]}" >/dev/null
+    done
+    say "Removed old firewall rules: ${#stale[@]}"
+  fi
+  if [[ "$ROUTERS" == l2tp ]]; then
+    before_rules=$(cat /etc/ufw/before.rules)
+    with_l2tp=$(ufw_before_rules_l2tp "$before_rules")
+    if [[ "$with_l2tp" != "$before_rules" ]]; then
+      printf '%s\n' "$with_l2tp" > /etc/ufw/before.rules
+      if [[ "$mode" == ufw ]]; then ufw reload >/dev/null; fi
+    fi
+  fi
+  [[ "$mode" == none ]] && ufw --force enable >/dev/null
+  case "$ROUTERS" in
+    wireguard) routers_note=", UDP $WG_PORT; RADIUS and 8088 on wg0 only" ;;
+    l2tp) routers_note=", IPsec (UDP 500, 4500, ESP), L2TP only inside IPsec; RADIUS and 8088 from the tunnel network $L2TP_SUBNET" ;;
+    public) routers_note="; RADIUS and 8088 from anywhere (FreeRADIUS answers only the routers/NAS added in the panel)" ;;
+    *) routers_note="; RADIUS and 8088 from $ROUTER_NETWORK" ;;
+  esac
+  panel_ports="80, 443"
+  [[ "$ACCESS" == local ]] && panel_ports="80 from private networks only"
+  FIREWALL_NOTE="ufw: SSH (${ssh_port:-22}), $panel_ports$routers_note."
+  say "$FIREWALL_NOTE"
+fi
+
+vendor=$(cloud_vendor "$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/bios_vendor /sys/class/dmi/id/chassis_asset_tag 2>/dev/null | tr '\n' ' ')")
+if [[ -n "$vendor" ]]; then
+  FIREWALL_NOTE+="${note_space}This server runs at $vendor: its own firewall (security group) must allow the same ports."
+  [[ "$vendor" == "Oracle Cloud" ]] && FIREWALL_NOTE+=" Oracle images also have iptables rules in /etc/iptables/rules.v4 that block them."
+  say "$FIREWALL_NOTE"
+elif [[ -d /var/lib/cloud/instance ]]; then
+  FIREWALL_NOTE+="${note_space}If this server runs at a cloud provider, its firewall must allow the same ports."
+fi

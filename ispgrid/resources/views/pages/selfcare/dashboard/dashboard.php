@@ -1,0 +1,330 @@
+<?php
+
+use App\Actions\Payments\StartOnlinePayment;
+use App\Billing\BillingSettings;
+use App\Billing\Pdf\ReceiptView;
+use App\Enums\InvoiceStatus;
+use App\Enums\OnlinePaymentOrigin;
+use App\Enums\ServiceType;
+use App\Exceptions\GatewayUnavailable;
+use App\Exceptions\NothingToPay;
+use App\Exceptions\TooManyPaymentAttempts;
+use App\Http\Middleware\SelfcareSession;
+use App\Models\Account;
+use App\Models\AppSetting;
+use App\Models\Invoice;
+use App\Models\Payment;
+use App\Models\Radacct;
+use App\Models\Radpostauth;
+use App\Models\SelfcareAccount;
+use App\Payments\PaymentGateways;
+use App\Payments\QuickPay;
+use App\Payments\UpiDetails;
+use App\Support\Money;
+use App\Support\PublicPage;
+use App\Support\Selfcare;
+use App\Support\SelfcareConnection;
+use App\Support\Units;
+use App\Support\Usage;
+use Illuminate\Contracts\View\View;
+use Livewire\Attributes\Computed;
+use Livewire\Component;
+
+/**
+ * The customer's one page after login: their plan and status, Renew, the connection details for their router, and
+ * links to the password pages. The customer is always the logged-in one, never a request parameter. Nothing about
+ * the NAS is shown.
+ */
+new class extends Component
+{
+    /** Why the last Pay press did not start a payment, shown in the Renew card. */
+    public string $payError = '';
+
+    #[Computed]
+    public function account(): SelfcareAccount
+    {
+        return SelfcareSession::account() ?? abort(403);
+    }
+
+    /**
+     * Switch connection shows when this mobile login may open more than one.
+     */
+    #[Computed]
+    public function canSwitch(): bool
+    {
+        return SelfcareSession::connections()->count() > 1;
+    }
+
+    /**
+     * @return array{name: string, username: string, account_number: ?string, plan: ?string, expiry: ?string, expired: bool, status: string, color: string}
+     */
+    #[Computed]
+    public function summary(): array
+    {
+        $account = $this->account;
+
+        return [
+            'name' => (string) ($account->fullname ?: $account->username),
+            'username' => (string) $account->username,
+            'account_number' => $account->account_number,
+            'plan' => $account->plan()->withTrashed()->value('name'),
+            'expiry' => $account->expiry?->format($this->dateFormat().' H:i'),
+            'expired' => $account->expiry !== null && $account->expiry->lessThanOrEqualTo(now()),
+            'status' => $account->status_id->label(),
+            'color' => $account->status_id->color(),
+        ];
+    }
+
+    /**
+     * Renew: Pay buttons with the amount (one per gateway this customer can use, and why another is hidden), the
+     * date renewal opens, the UPI details when the customer owes something and the pay page is closed, or the
+     * number to call.
+     *
+     * @return array{kind: 'pay'|'upi'|'opens'|'call'|'none', label: string, url?: ?string, gateways?: list<array{key: string, label: string}>, unavailable?: list<string>}
+     */
+    #[Computed]
+    public function renew(): array
+    {
+        $account = $this->account;
+        $phone = trim((string) AppSetting::valueOf('notice_phone', ''));
+
+        if (! QuickPay::isOpen()) {
+            $owed = $this->upiDetails === null ? null : app(QuickPay::class)->quote($account);
+
+            if ($owed !== null) {
+                return ['kind' => 'upi', 'label' => __('Pay :amount', ['amount' => Money::fromSettings()->format($owed->total)]), 'url' => null];
+            }
+
+            return $phone === ''
+                ? ['kind' => 'none', 'label' => '', 'url' => null]
+                : ['kind' => 'call', 'label' => __('To renew, call us: :phone', ['phone' => $phone]), 'url' => 'tel:'.preg_replace('/[^0-9+]/', '', $phone)];
+        }
+
+        $quote = app(QuickPay::class)->quote($account);
+
+        if ($quote !== null) {
+            $amount = Money::fromSettings()->format($quote->total);
+
+            $gateways = app(PaymentGateways::class);
+            $label = fn (string $key): ?string => ($class = $gateways->class($key)) === null ? null : $class::label();
+            ['usable' => $usable, 'hidden' => $hidden] = $gateways->splitFor(Account::query()->findOrFail($account->id));
+
+            return [
+                'kind' => 'pay',
+                'label' => $quote->renewal !== null ? __('Renew for :amount', ['amount' => $amount]) : __('Pay :amount', ['amount' => $amount]),
+                'gateways' => array_values(array_filter(array_map(fn (string $key): ?array => ($name = $label($key)) === null ? null : ['key' => $key, 'label' => $name], $usable))),
+                'unavailable' => array_values(array_filter(array_map(fn (string $key, string $message): ?string => ($name = $label($key)) === null ? null : $name.': '.$message, array_keys($hidden), $hidden))),
+            ];
+        }
+
+        $days = QuickPay::renewalDays();
+        $opens = $days === null || $account->expiry === null ? null : $account->expiry->subDays($days);
+
+        return $opens !== null && $opens->isFuture()
+            ? ['kind' => 'opens', 'label' => __('Renewal opens on :date', ['date' => $opens->format($this->dateFormat())]), 'url' => null]
+            : ['kind' => 'none', 'label' => '', 'url' => null];
+    }
+
+    /**
+     * Starts an online payment for the logged-in customer (never for a client-sent account) and hands them to the
+     * gateway. The gateway must be one this customer can use; the action checks again.
+     */
+    public function pay(string $gateway, StartOnlinePayment $start): void
+    {
+        $this->payError = '';
+
+        if (! QuickPay::isOpen()) {
+            $this->payError = __('The payment could not be started. Try again in a few minutes.');
+
+            return;
+        }
+
+        $account = Account::query()->find($this->account->id);
+
+        if ($account === null || ! in_array($gateway, app(PaymentGateways::class)->enabledFor($account), true)) {
+            $this->payError = __('The payment could not be started. Try again in a few minutes.');
+
+            return;
+        }
+
+        try {
+            $started = $start->handle($account->id, $gateway, request()->ip(), OnlinePaymentOrigin::Selfcare);
+        } catch (NothingToPay) {
+            $this->payError = __('Nothing to pay for this username or number.');
+
+            return;
+        } catch (TooManyPaymentAttempts) {
+            $this->payError = __('Too many tries. Wait an hour and try again, or call us.');
+
+            return;
+        } catch (GatewayUnavailable $refused) {
+            report($refused);
+            $this->payError = __('The payment could not be started. Try again in a few minutes.');
+
+            return;
+        }
+
+        $this->redirect($started->start->kind === 'redirect' ? $started->start->url : route('selfcare.pay-go', $started->payment->public_id));
+    }
+
+    /**
+     * The UPI details once per render (null without INR or when none are set).
+     */
+    #[Computed]
+    public function upiDetails(): ?UpiDetails
+    {
+        return UpiDetails::current();
+    }
+
+    /**
+     * The operator's UPI details, shown in the Renew card when there is something to pay (null without INR).
+     */
+    #[Computed]
+    public function upi(): ?UpiDetails
+    {
+        return in_array($this->renew['kind'], ['pay', 'upi'], true) ? $this->upiDetails : null;
+    }
+
+    /**
+     * The connection details that have a value, labelled.
+     *
+     * @return array<string, string>
+     */
+    #[Computed]
+    public function connection(): array
+    {
+        $labels = [
+            'ip' => __('IP address'),
+            'mask' => __('Subnet mask'),
+            'gateway' => __('Gateway'),
+            'dns1' => __('DNS 1'),
+            'dns2' => __('DNS 2'),
+        ];
+        $rows = [];
+
+        foreach (SelfcareConnection::for($this->account) as $key => $value) {
+            if ($value !== null && $value !== '') {
+                $rows[$labels[$key]] = $value;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Data used since the last recharge and per day for the last 30 days, from the usage database FreeRADIUS checks
+     * limits against. Null when there is nothing to show.
+     *
+     * @return ?array{period: string, days: list<array{day: string, download: string, upload: string}>}
+     */
+    #[Computed]
+    public function usage(): ?array
+    {
+        $username = (string) $this->account->username;
+        $period = Usage::sinceRecharge($username);
+        $days = Usage::days($username, 30);
+
+        if ($period['bytes'] === 0 && $days === []) {
+            return null;
+        }
+
+        return [
+            'period' => Units::bytes($period['bytes']),
+            'days' => array_map(fn (array $day): array => [
+                'day' => $day['day']->format($this->dateFormat()),
+                'download' => Units::bytes($day['download']),
+                'upload' => Units::bytes($day['upload']),
+            ], $days),
+        ];
+    }
+
+    /**
+     * The customer's open sessions: when they started, the IP, how long and how much data. Never the NAS.
+     *
+     * @return list<array{started: string, ip: string, uptime: string, data: string}>
+     */
+    #[Computed]
+    public function sessions(): array
+    {
+        return Radacct::query()->open()->where('username', $this->account->username)->orderBy('acctstarttime')
+            ->get(['acctstarttime', 'framedipaddress', 'acctinputoctets', 'acctoutputoctets'])
+            ->map(fn (Radacct $session): array => [
+                'started' => $session->acctstarttime->format($this->dateFormat().' H:i'),
+                'ip' => (string) $session->framedipaddress,
+                'uptime' => Units::duration((int) $session->acctstarttime->diffInSeconds(now())),
+                'data' => Units::bytes((int) $session->acctinputoctets + (int) $session->acctoutputoctets),
+            ])->all();
+    }
+
+    /**
+     * The last 10 login attempts: when and the result in words. No reason text, router or MAC.
+     *
+     * @return list<array{when: string, result: string, color: string}>
+     */
+    #[Computed]
+    public function logins(): array
+    {
+        return Radpostauth::query()->where('username', $this->account->username)->orderByDesc('authdate')->orderByDesc('id')->limit(10)
+            ->get(['id', 'authdate', 'reply', 'reply_msg'])
+            ->map(fn (Radpostauth $login): array => [
+                'when' => $login->authdate->format($this->dateFormat().' H:i'),
+                'result' => $login->result()->label(),
+                'color' => $login->result()->color(),
+            ])->all();
+    }
+
+    /**
+     * The last 12 invoices (not cancelled) and receipts (payments not removed), while invoicing is on.
+     *
+     * @return ?array{invoices: list<array{number: string, date: string, total: string, status: string, color: string, url: string}>, receipts: list<array{number: string, date: string, amount: string, url: string}>}
+     */
+    #[Computed]
+    public function bills(): ?array
+    {
+        if (! BillingSettings::current()->canIssue()) {
+            return null;
+        }
+
+        $money = Money::fromSettings();
+        $accountId = $this->account->id;
+
+        return [
+            'invoices' => Invoice::query()->where('account_id', $accountId)->where('status', '!=', InvoiceStatus::Cancelled)
+                ->latest('issue_date')->latest('id')->limit(12)->get()
+                ->map(fn (Invoice $invoice): array => [
+                    'number' => $invoice->number,
+                    'date' => $invoice->issue_date->format($this->dateFormat()),
+                    'total' => $money->format((string) $invoice->total),
+                    'status' => $invoice->status->label(),
+                    'color' => $invoice->status->color(),
+                    'url' => route('selfcare.invoice', $invoice->id),
+                ])->all(),
+            'receipts' => Payment::query()->where('account_id', $accountId)->latest('paid_at')->latest('id')->limit(12)->get()
+                ->map(fn (Payment $payment): array => [
+                    'number' => ReceiptView::number($payment),
+                    'date' => $payment->paid_at->format($this->dateFormat()),
+                    'amount' => $money->format((string) $payment->amount),
+                    'url' => route('selfcare.receipt', $payment->id),
+                ])->all(),
+        ];
+    }
+
+    /**
+     * Whether this customer may change their PPPoE password here.
+     */
+    #[Computed]
+    public function canChangePppoePassword(): bool
+    {
+        return Selfcare::canChangePppoePassword() && $this->account->service_type === ServiceType::Ppp;
+    }
+
+    public function render(): View
+    {
+        return $this->view()->layout('layouts::public', [...PublicPage::data(), 'title' => __('Selfcare')]);
+    }
+
+    private function dateFormat(): string
+    {
+        return (string) AppSetting::valueOf('date_format', 'd/m/Y');
+    }
+};

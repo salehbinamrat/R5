@@ -1,0 +1,359 @@
+<?php
+
+use App\Console\Commands\PruneRadiusLogs;
+use App\Enums\IpRangeKind;
+use App\Http\Middleware\SetLocale;
+use App\Jobs\NumberAccounts;
+use App\Livewire\Concerns\AuthorizesEveryRequest;
+use App\Livewire\Concerns\ShowsToasts;
+use App\Models\AppSetting;
+use App\Models\IpRange;
+use App\Models\Pool;
+use App\Models\RadiusSetting;
+use App\Support\AccountNumbers;
+use App\Support\ExpiryCalculator;
+use App\Support\Hotspot;
+use App\Support\NoticePage;
+use App\Support\PasswordPattern;
+use App\Support\PhoneLength;
+use App\Support\RequiredCustomerFields;
+use App\Support\Selfcare;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\App;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Title;
+use Livewire\Component;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+new #[Title('App settings')] class extends Component
+{
+    use AuthorizesEveryRequest, ShowsToasts;
+
+    private const DATE_FORMATS = ['d/m/Y', 'm/d/Y', 'Y-m-d', 'd.m.Y', 'd-m-Y'];
+
+    /**
+     * On/off settings saved as '1' or '0' under their own key.
+     *
+     * @var array<string, string>
+     */
+    private const SWITCHES = [
+        'selfcare_enabled' => 'selfcare.enabled',
+        'selfcare_pppoe_password_change' => 'selfcare.pppoe_password_change',
+    ];
+
+    /**
+     * Text settings saved under a key other than their field name.
+     *
+     * @var array<string, string>
+     */
+    private const KEYED = [
+        'account_id_prefix' => AccountNumbers::PREFIX,
+        'account_id_start' => AccountNumbers::START,
+        'password_pattern' => PasswordPattern::SETTING,
+        'phone_digits_min' => PhoneLength::MIN_SETTING,
+    ];
+
+    public string $date_format = '';
+
+    public string $phone_country_code = '';
+
+    public string $phone_digits = '';
+
+    public string $phone_digits_min = '';
+
+    public string $tax_id_label = '';
+
+    public string $business_id_label = '';
+
+    public string $expiry_mode = '';
+
+    public string $default_pool_ppp = '';
+
+    public string $default_pool_hotspot = '';
+
+    public string $default_ip_range_ipoe = '';
+
+    public string $notice_isp_name = '';
+
+    public string $notice_phone = '';
+
+    public string $notice_message = '';
+
+    public string $locale = '';
+
+    public string $login_log_days = '';
+
+    public string $session_history_days = '';
+
+    public string $account_id_prefix = '';
+
+    public string $account_id_start = '';
+
+    public string $password_pattern = '';
+
+    public bool $hotspot_enabled = false;
+
+    public bool $selfcare_enabled = false;
+
+    public bool $selfcare_pppoe_password_change = false;
+
+    /** @var list<string> */
+    public array $required_customer_fields = [];
+
+    public function mount(): void
+    {
+        $this->authorizeAccess();
+
+        foreach (array_keys(Arr::except($this->rules(), [Hotspot::SETTING, 'required_customer_fields', 'required_customer_fields.*', ...array_keys(self::SWITCHES)])) as $key) {
+            $this->{$key} = (string) AppSetting::valueOf(self::KEYED[$key] ?? $key, '');
+        }
+
+        $this->hotspot_enabled = Hotspot::enabled();
+
+        foreach (self::SWITCHES as $property => $key) {
+            $this->{$property} = AppSetting::valueOf($key, '0') === '1';
+        }
+        $this->required_customer_fields = RequiredCustomerFields::saved();
+
+        // Installs from before languages have no row until the next upgrade seeds it: they run in English.
+        $this->locale = $this->locale !== '' ? $this->locale : config('app.fallback_locale');
+
+        // Installs from before the cleanup job have no row until the next upgrade seeds it: the job keeps 90 days.
+        $this->login_log_days = $this->login_log_days !== '' ? $this->login_log_days : (string) PruneRadiusLogs::DEFAULT_LOGIN_LOG_DAYS;
+
+        // Installs from before session cleanup have no row until the next upgrade seeds it: the job keeps 365 days.
+        $this->session_history_days = $this->session_history_days !== '' ? $this->session_history_days : (string) PruneRadiusLogs::DEFAULT_SESSION_HISTORY_DAYS;
+    }
+
+    /**
+     * Who may use this page: checked when it opens and on every later request (AuthorizesEveryRequest).
+     */
+    protected function authorizeAccess(): void
+    {
+        $this->authorize('manage-app-settings');
+    }
+
+    /**
+     * @return array<string, array<int, mixed>>
+     */
+    protected function rules(): array
+    {
+        return [
+            'date_format' => ['required', Rule::in(self::DATE_FORMATS)],
+            'phone_country_code' => ['required', 'regex:/^\+[1-9][0-9]{0,3}$/'],
+            'phone_digits' => ['required', 'integer', 'between:4,15'],
+            'phone_digits_min' => ['nullable', 'integer', 'between:4,15', 'lte:phone_digits'],
+            'tax_id_label' => ['nullable', 'string', 'max:30'],
+            'business_id_label' => ['nullable', 'string', 'max:30'],
+            'expiry_mode' => ['required', Rule::in(array_keys($this->expiryModes()))],
+            'default_pool_ppp' => ['nullable', 'integer', Rule::exists(Pool::class, 'id')->withoutTrashed()],
+            'default_pool_hotspot' => ['nullable', 'integer', Rule::exists(Pool::class, 'id')->withoutTrashed()],
+            'default_ip_range_ipoe' => ['nullable', 'integer', Rule::exists(IpRange::class, 'id')->withoutTrashed()->where('kind', IpRangeKind::Ipoe->value)],
+            'notice_isp_name' => ['nullable', 'string', 'max:100'],
+            'notice_phone' => ['nullable', 'string', 'max:30'],
+            'notice_message' => ['required', 'string', 'max:500'],
+            'locale' => ['required', Rule::in(array_keys(config('app.locales')))],
+            'login_log_days' => ['required', 'integer', 'between:7,3650'],
+            'session_history_days' => ['required', 'integer', 'between:31,3650'],
+            'hotspot_enabled' => ['boolean'],
+            'selfcare_enabled' => ['boolean'],
+            'selfcare_pppoe_password_change' => ['boolean'],
+            'account_id_prefix' => ['nullable', 'string', 'max:10', 'regex:/^[A-Za-z0-9\/._-]*$/D'],
+            'account_id_start' => ['nullable', 'integer', 'between:1,999999999'],
+            'password_pattern' => PasswordPattern::rules(),
+            'required_customer_fields' => ['array'],
+            'required_customer_fields.*' => ['string', Rule::in(RequiredCustomerFields::FIELDS)],
+        ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    protected function messages(): array
+    {
+        return [
+            'default_pool_ppp.exists' => __('This pool was deleted. Choose another one.'),
+            'default_pool_hotspot.exists' => __('This pool was deleted. Choose another one.'),
+            'default_ip_range_ipoe.exists' => __('This range was deleted. Choose another one.'),
+            'account_id_prefix.regex' => __('Use letters, digits and / . _ - only.'),
+            'phone_digits_min.lte' => __('The shortest number cannot be longer than the phone number digits.'),
+        ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    #[Computed]
+    public function requiredFieldOptions(): array
+    {
+        return RequiredCustomerFields::labels();
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    #[Computed]
+    public function pools(): array
+    {
+        return Pool::query()->orderBy('name')->pluck('name', 'id')->all();
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    #[Computed]
+    public function ipRanges(): array
+    {
+        return IpRange::query()->where('kind', IpRangeKind::Ipoe)->orderBy('name')->get()
+            ->mapWithKeys(fn (IpRange $range): array => [$range->id => "{$range->name} ({$range->network})"])
+            ->all();
+    }
+
+    /**
+     * Validates every field first, then saves all of them in one transaction: one bad field saves nothing.
+     */
+    public function save(): void
+    {
+        $this->authorize('manage-app-settings');
+
+        $validated = $this->validate();
+        $hotspot = (bool) Arr::pull($validated, Hotspot::SETTING);
+        /** @var list<string> $required */
+        $required = Arr::pull($validated, 'required_customer_fields', []);
+        $languageChanged = $validated['locale'] !== AppSetting::valueOf('locale', config('app.fallback_locale'));
+
+        $numberAccounts = DB::transaction(function () use ($validated, $hotspot, $required): bool {
+            $this->saveHotspot($hotspot);
+            RequiredCustomerFields::save($required);
+            $oldStart = trim((string) AppSetting::valueOf(AccountNumbers::START, ''));
+
+            foreach ($validated as $key => $value) {
+                $setting = self::SWITCHES[$key] ?? self::KEYED[$key] ?? $key;
+                $value = array_key_exists($key, self::SWITCHES) ? ($value ? '1' : '0') : (string) $value;
+                $value = array_key_exists($key, self::KEYED) ? trim($value) : $value;
+
+                // An empty keyed setting nobody saved before stays unsaved (no "created" entry for nothing).
+                if (array_key_exists($key, self::KEYED) && $value === '' && AppSetting::valueOf($setting) === null) {
+                    continue;
+                }
+
+                AppSetting::put($setting, $value);
+            }
+
+            $start = trim((string) ($validated['account_id_start'] ?? ''));
+
+            // A new start number restarts the count there; numbers customers hold are still skipped.
+            if ($start !== '' && $start !== $oldStart) {
+                activity()->withoutLogging(fn () => AppSetting::put(AccountNumbers::NEXT, $start));
+            }
+
+            return $oldStart === '' && $start !== '';
+        }, attempts: 3);
+
+        // Existing customers are numbered once, when account IDs are first turned on.
+        if ($numberAccounts) {
+            NumberAccounts::dispatch(auth()->id());
+        }
+
+        if (! $languageChanged) {
+            $this->toast(__('Settings saved.'));
+
+            return;
+        }
+
+        // A full reload, so the whole page (menu included) shows the new language for staff who follow it.
+        App::setLocale(SetLocale::resolve(auth()->user()->locale));
+        session()->flash('toast', __('Settings saved.'));
+        $this->redirectRoute('app-settings.edit');
+    }
+
+    /**
+     * The Hotspot login.html for IPoE devices whose IP no customer has, from the saved notice settings.
+     */
+    public function downloadIpoeLoginPage(): StreamedResponse
+    {
+        $this->authorize('manage-app-settings');
+        $html = NoticePage::ipoeLoginPage();
+
+        return response()->streamDownload(function () use ($html): void {
+            echo $html;
+        }, 'login.html', ['Content-Type' => 'text/html; charset=utf-8']);
+    }
+
+    /**
+     * Turning Hotspot off would hide customers who still get online. The settings row is locked first: a Hotspot
+     * customer saved meanwhile holds a shared lock on it (Hotspot::enabled()), so it is either counted here or
+     * refused there. isp reads the column on every Hotspot page login, so no FreeRADIUS restart is needed.
+     * Without the settings row (every install seeds it) Hotspot reads as off, and only turning it on is refused.
+     */
+    private function saveHotspot(bool $enabled): void
+    {
+        $settings = RadiusSetting::query()->whereKey(1)->lockForUpdate()->first();
+
+        if ($settings === null) {
+            if ($enabled) {
+                throw ValidationException::withMessages([Hotspot::SETTING => __('The FreeRADIUS settings are missing. Run the installer again to restore them.')]);
+            }
+
+            return;
+        }
+
+        $count = $enabled ? 0 : Hotspot::customerCount();
+
+        if ($count > 0) {
+            throw ValidationException::withMessages([Hotspot::SETTING => trans_choice(
+                ':count Hotspot customer exists. Delete them or change their type first.|:count Hotspot customers exist. Delete them or change their type first.',
+                $count,
+            )]);
+        }
+
+        $settings->update([Hotspot::SETTING => $enabled]);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    #[Computed]
+    public function languages(): array
+    {
+        return config('app.locales');
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    #[Computed]
+    public function dateFormats(): array
+    {
+        $example = CarbonImmutable::create(2026, 12, 31);
+
+        return collect(self::DATE_FORMATS)
+            ->mapWithKeys(fn (string $format): array => [$format => $example->format($format)])
+            ->all();
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    #[Computed]
+    public function expiryModes(): array
+    {
+        return ExpiryCalculator::modes();
+    }
+
+    #[Computed]
+    public function selfcareUrl(): string
+    {
+        return Selfcare::url();
+    }
+
+    #[Computed]
+    public function timezone(): string
+    {
+        return config('app.timezone');
+    }
+};

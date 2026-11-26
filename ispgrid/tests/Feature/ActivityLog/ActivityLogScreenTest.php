@@ -1,0 +1,112 @@
+<?php
+
+use App\Models\AppSetting;
+use App\Models\ConnectionType;
+use App\Models\Nas;
+use App\Models\NotificationProvider;
+use App\Models\NotificationRule;
+use App\Models\Role;
+use App\Models\User;
+use Livewire\Livewire;
+
+beforeEach(function () {
+    $this->me = User::factory()->create(['name' => 'Asha']);
+    $this->actingAs($this->me);
+});
+
+it('lists changes newest first with who made them and what changed', function () {
+    AppSetting::put('currency_code', 'INR');
+    AppSetting::put('currency_code', 'USD');
+
+    Livewire::test('pages::activity.index')
+        ->assertSeeInOrder(['Updated', 'App setting', 'currency_code', 'INR', 'USD', 'Created'])
+        ->assertSee('Asha');
+});
+
+it('keeps the name of a staff member who was later disabled', function () {
+    $ravi = User::factory()->create(['name' => 'Ravi']);
+    $this->actingAs($ravi);
+    AppSetting::put('date_format', 'Y-m-d');
+
+    $this->actingAs($this->me);
+    $ravi->delete();
+
+    Livewire::test('pages::activity.index')
+        ->set('staff', (string) $ravi->id)
+        ->assertSee('date_format')
+        ->assertDontSee('System');
+    // The staff filter lists Ravi either way; "System" would show if the row lost its causer.
+});
+
+it('shows System for changes made without a login', function () {
+    auth()->logout();
+    AppSetting::put('notice_phone', '1800 000 000');
+    $this->actingAs($this->me);
+
+    Livewire::test('pages::activity.index')
+        ->set('type', (new AppSetting)->getMorphClass())
+        ->assertSee('System')
+        ->assertSee('notice_phone');
+});
+
+it('filters by staff member', function () {
+    $ravi = User::factory()->create(['name' => 'Ravi']);
+    $this->actingAs($ravi);
+    AppSetting::put('currency_symbol', '$');
+    $this->actingAs($this->me);
+    AppSetting::put('phone_digits', '9');
+
+    Livewire::test('pages::activity.index')
+        ->set('staff', (string) $this->me->id)
+        ->assertSee('phone_digits')
+        ->assertDontSee('currency_symbol');
+});
+
+it('names what a delete removed instead of showing it changed to empty', function () {
+    ConnectionType::factory()->create(['name' => 'Fibre'])->delete();
+
+    Livewire::test('pages::activity.index')
+        ->set('type', (new ConnectionType)->getMorphClass())
+        ->assertSeeInOrder(['Deleted', 'Fibre'])
+        ->assertDontSee('(empty)');
+});
+
+it('calls a deleted staff login Disabled', function () {
+    User::factory()->create(['name' => 'Ravi'])->delete();
+
+    Livewire::test('pages::activity.index')
+        ->assertSee('Disabled');
+});
+
+it('links the System menu to the activity log', function () {
+    $this->get(route('dashboard'))->assertSee(route('activity.index'));
+});
+
+it('names routers on the activity screen', function () {
+    Nas::factory()->create(['shortname' => 'core-1']);
+
+    Livewire::test('pages::activity.index')
+        ->assertSee('NAS')
+        ->assertSee('core-1');
+});
+
+it('shows a role change on a staff member and a deleted role by its name', function () {
+    $ravi = User::factory()->create(['name' => 'Ravi']);
+    $role = Role::create(['name' => 'Billing desk']);
+
+    Livewire::test('pages::staff.index')->call('editRole', $ravi->id)->set('role', (string) $role->id)->call('saveRole');
+    Livewire::test('pages::staff.index')->call('editRole', $ravi->id)->set('role', (string) Role::findByName(Role::ADMIN)->id)->call('saveRole');
+    Livewire::test('pages::staff.roles')->call('delete', $role->id);
+
+    Livewire::test('pages::activity.index')
+        ->assertSeeInOrder(['Deleted', 'Role', 'Billing desk', 'Role changed', 'Staff', 'Ravi', 'Billing desk', 'Admin']);
+});
+
+it('names notification rules and providers in the log', function () {
+    NotificationRule::factory()->create(['name' => 'Expiring soon']);
+    $provider = NotificationProvider::query()->create(['provider' => 'wacrm', 'enabled' => true, 'settings' => []]);
+    activity()->performedOn($provider)->event('updated')->withChanges(['attributes' => ['enabled' => 'On', 'changed' => 'API key']])->log('updated');
+
+    Livewire::test('pages::activity.index')
+        ->assertSee(['Notification rule', 'Expiring soon', 'Notification provider', 'wacrm (WhatsApp)']);
+});

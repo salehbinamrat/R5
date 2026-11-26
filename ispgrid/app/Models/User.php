@@ -1,0 +1,127 @@
+<?php
+
+namespace App\Models;
+
+use App\Enums\Permission;
+use Database\Factories\UserFactory;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Attributes\Hidden;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Laravel\Fortify\Contracts\PasskeyUser;
+use Laravel\Fortify\PasskeyAuthenticatable;
+use Laravel\Fortify\TwoFactorAuthenticatable;
+use Spatie\Activitylog\Models\Concerns\LogsActivity;
+use Spatie\Activitylog\Support\LogOptions;
+use Spatie\Permission\Traits\HasRoles;
+
+/**
+ * @property int $id
+ * @property string $name
+ * @property string $email
+ * @property string|null $locale
+ * @property Carbon|null $email_verified_at
+ * @property string $password
+ * @property string|null $two_factor_secret
+ * @property string|null $two_factor_recovery_codes
+ * @property Carbon|null $two_factor_confirmed_at
+ * @property string|null $remember_token
+ * @property Carbon|null $created_at
+ * @property Carbon|null $updated_at
+ */
+#[Fillable(['name', 'email', 'password', 'locale'])]
+#[Hidden(['password', 'two_factor_secret', 'two_factor_recovery_codes', 'remember_token'])]
+class User extends Authenticatable implements PasskeyUser
+{
+    /** @use HasFactory<UserFactory> */
+    use HasFactory, HasRoles, LogsActivity, Notifiable, PasskeyAuthenticatable, SoftDeletes, TwoFactorAuthenticatable;
+
+    /**
+     * Disabling a staff member logs them out everywhere, so a restore never revives an old cookie or session.
+     */
+    protected static function booted(): void
+    {
+        static::deleted(function (User $user): void {
+            if (! $user->isForceDeleting()) {
+                $user->endSessions();
+            }
+        });
+    }
+
+    /**
+     * Admin is built in: it can do everything, including what a later release adds to the list.
+     */
+    public function isAdmin(): bool
+    {
+        return $this->hasRole(Role::ADMIN);
+    }
+
+    /**
+     * Whether this staff member's role allows the action. Every policy and gate asks this.
+     */
+    public function hasAccess(Permission|string $permission): bool
+    {
+        return $this->isAdmin() || $this->checkPermissionTo($permission instanceof Permission ? $permission->value : $permission);
+    }
+
+    /**
+     * The one role this staff member has, if any. (Not role(): that name is HasRoles' query scope.)
+     */
+    public function staffRole(): ?Role
+    {
+        return $this->roles->whereInstanceOf(Role::class)->first();
+    }
+
+    /**
+     * Log this staff member out on every device: a new remember token, and their database sessions removed
+     * (except $keepSessionId: the browser that changed the password stays logged in).
+     */
+    public function endSessions(?string $keepSessionId = null): void
+    {
+        $this->forceFill(['remember_token' => Str::random(60)])->saveQuietly();
+
+        if (config('session.driver') === 'database') {
+            DB::table(config('session.table', 'sessions'))->where('user_id', $this->getKey())
+                ->when($keepSessionId !== null, fn ($query) => $query->where('id', '!=', $keepSessionId))
+                ->delete();
+        }
+    }
+
+    /**
+     * Only name and email are logged: never the password, remember token or two-factor secrets.
+     */
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()->logOnly(['name', 'email'])->logOnlyDirty()->dontLogEmptyChanges();
+    }
+
+    /**
+     * Get the attributes that should be cast.
+     *
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',
+        ];
+    }
+
+    /**
+     * Get the user's initials
+     */
+    public function initials(): string
+    {
+        $initials = Str::initials($this->name, true);
+
+        return Str::length($initials) > 1
+            ? Str::substr($initials, 0, 1).Str::substr($initials, -1)
+            : $initials;
+    }
+}

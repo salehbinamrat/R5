@@ -1,0 +1,289 @@
+<?php
+
+namespace App\Models;
+
+use App\Casts\Amount;
+use App\Enums\AccountStatus;
+use App\Enums\AdvanceRenewalStatus;
+use App\Enums\ServiceKind;
+use App\Enums\ServiceType;
+use Carbon\CarbonInterface;
+use Database\Factories\AccountFactory;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Attributes\Hidden;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Spatie\Activitylog\Models\Concerns\LogsActivity;
+use Spatie\Activitylog\Support\LogOptions;
+
+/**
+ * A customer account. The source of truth for its FreeRADIUS rows (SyncAccountToRadius rebuilds them).
+ * The password is stored in plain text like radcheck: PAP, CHAP and MS-CHAP need the cleartext.
+ * A Hotspot account recharged with a first-login plan has hotspot_pending_validity (minutes) and no expiry
+ * until FreeRADIUS stamps its first login (app-integration.md section 8).
+ */
+#[Fillable(['username', 'account_number', 'password', 'title', 'fullname', 'company', 'mobile', 'whatsapp', 'alt_number', 'email',
+    'tax_id', 'business_id', 'remarks', 'notifications_off', 'address_id', 'connection_type_id', 'user_id',
+    'service_type', 'mac_type', 'plan_id', 'nas_id', 'status_id', 'expiry', 'hotspot_pending_validity', 'hotspot_first_login_at',
+    'usage_since', 'auto_renew', 'billing_free', 'discount_type', 'discount_percent', 'discount_amount', 'payment_terms_days', 'billing_name',
+    'billing_address_id', 'place_of_supply', 'ip_id', 'pool_id', 'override_plan', 'override_until', 'override_upload', 'override_download', 'override_burst_upload', 'override_burst_download',
+    'override_threshold_upload', 'override_threshold_download', 'override_burst_time', 'override_priority',
+    'override_min_upload', 'override_min_download'])]
+#[Hidden(['selfcare_password'])]
+class Account extends Model
+{
+    /** @use HasFactory<AccountFactory> */
+    use HasFactory, LogsActivity, SoftDeletes;
+
+    /**
+     * The database defaults, so a customer created in this request does not log them as changed on its first
+     * update.
+     *
+     * @var array<string, mixed>
+     */
+    protected $attributes = [
+        'mac_type' => 1,
+        'status_id' => 1,
+        'override_plan' => false,
+        'notifications_off' => false,
+        'auto_renew' => false,
+        'billing_free' => false,
+        'discount_type' => 'percent',
+        'discount_percent' => '0.00',
+        'discount_amount' => '0.000',
+        'payment_terms_days' => 0,
+        'selfcare_must_change' => false,
+    ];
+
+    /**
+     * Every column staff edit, never the password. The address, address lists and custom attributes live in
+     * other tables; the form logs their changes itself.
+     */
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()->logOnly([
+            'username', 'account_number', 'title', 'fullname', 'company', 'mobile', 'whatsapp', 'alt_number', 'email',
+            'tax_id', 'business_id', 'remarks', 'notifications_off', 'connection_type_id',
+            'service_type', 'mac_type', 'plan_id', 'nas_id', 'status_id', 'expiry', 'usage_since', 'auto_renew', 'ip_id', 'pool_id',
+            'override_plan', 'override_until', 'override_upload', 'override_download', 'override_burst_upload', 'override_burst_download',
+            'override_threshold_upload', 'override_threshold_download', 'override_burst_time', 'override_priority',
+            'override_min_upload', 'override_min_download',
+        ])->logOnlyDirty()->dontLogEmptyChanges();
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'status_id' => AccountStatus::class,
+            'service_type' => ServiceType::class,
+            'expiry' => 'datetime',
+            'hotspot_pending_validity' => 'integer',
+            'hotspot_first_login_at' => 'datetime',
+            'usage_since' => 'datetime',
+            'override_plan' => 'boolean',
+            'override_until' => 'datetime',
+            'billing_free' => 'boolean',
+            'discount_percent' => 'decimal:2',
+            'discount_amount' => Amount::class,
+            'payment_terms_days' => 'integer',
+            'auto_renew' => 'boolean',
+            'notifications_off' => 'boolean',
+            'mac_type' => 'integer',
+            'plan_id' => 'integer',
+            'nas_id' => 'integer',
+            'ip_id' => 'integer',
+            'pool_id' => 'integer',
+            'connection_type_id' => 'integer',
+            'address_id' => 'integer',
+            'override_burst_time' => 'integer',
+            'override_priority' => 'integer',
+            'selfcare_must_change' => 'boolean',
+            'selfcare_password_set_at' => 'datetime',
+            'selfcare_last_login_at' => 'datetime',
+        ];
+    }
+
+    /**
+     * @return BelongsTo<Plan, $this>
+     */
+    public function plan(): BelongsTo
+    {
+        return $this->belongsTo(Plan::class);
+    }
+
+    /**
+     * @return BelongsTo<Pool, $this>
+     */
+    public function pool(): BelongsTo
+    {
+        return $this->belongsTo(Pool::class);
+    }
+
+    /**
+     * @return BelongsTo<Ip, $this>
+     */
+    public function ip(): BelongsTo
+    {
+        return $this->belongsTo(Ip::class);
+    }
+
+    /**
+     * The router this account is bound to, if any.
+     *
+     * @return BelongsTo<Nas, $this>
+     */
+    public function nas(): BelongsTo
+    {
+        return $this->belongsTo(Nas::class);
+    }
+
+    /**
+     * @return BelongsTo<Address, $this>
+     */
+    public function address(): BelongsTo
+    {
+        return $this->belongsTo(Address::class);
+    }
+
+    /**
+     * The address invoices are billed to, when it differs from the connection address.
+     *
+     * @return BelongsTo<Address, $this>
+     */
+    public function billingAddress(): BelongsTo
+    {
+        return $this->belongsTo(Address::class, 'billing_address_id');
+    }
+
+    /**
+     * @return HasMany<Invoice, $this>
+     */
+    public function invoices(): HasMany
+    {
+        return $this->hasMany(Invoice::class);
+    }
+
+    /**
+     * @return BelongsTo<ConnectionType, $this>
+     */
+    public function connectionType(): BelongsTo
+    {
+        return $this->belongsTo(ConnectionType::class);
+    }
+
+    /**
+     * The future customer-portal login (unused in the MVP).
+     *
+     * @return BelongsTo<User, $this>
+     */
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    /**
+     * @return HasOne<Ipoe, $this>
+     */
+    public function ipoe(): HasOne
+    {
+        return $this->hasOne(Ipoe::class);
+    }
+
+    /**
+     * @return BelongsToMany<AddressList, $this>
+     */
+    public function addressLists(): BelongsToMany
+    {
+        return $this->belongsToMany(AddressList::class, 'account_address_list');
+    }
+
+    /**
+     * Custom RADIUS reply attributes of this account.
+     *
+     * @return HasMany<AccountAttribute, $this>
+     */
+    public function radiusAttributes(): HasMany
+    {
+        return $this->hasMany(AccountAttribute::class);
+    }
+
+    /**
+     * What the panel heads a customer with: the full name staff know them by, with the username under it, or the
+     * username alone when there is no name.
+     *
+     * @return array{name: string, login: ?string}
+     */
+    public function heading(): array
+    {
+        $name = trim((string) $this->fullname);
+
+        return $name === '' ? ['name' => $this->username, 'login' => null] : ['name' => $name, 'login' => $this->username];
+    }
+
+    /**
+     * Every service the customer took, ended ones too.
+     *
+     * @return HasMany<CustomerService, $this>
+     */
+    public function services(): HasMany
+    {
+        return $this->hasMany(CustomerService::class);
+    }
+
+    /**
+     * The Static IP service that is not ended, if any (at most one): it owns ip_id.
+     *
+     * @return HasOne<CustomerService, $this>
+     */
+    public function staticIpService(): HasOne
+    {
+        return $this->hasOne(CustomerService::class)->whereNull('ended_at')
+            ->whereHas('item', fn ($query) => $query->where('service_kind', ServiceKind::StaticIp->value))->latestOfMany();
+    }
+
+    /**
+     * Whether the customer's fixed IP belongs to a Static IP service whose paid-until has passed: FreeRADIUS then
+     * gets no Framed-IP-Address (the pool applies), while the IP stays reserved. Decided by the date, not by the
+     * scheduler having run, so a login after paid-until never gets the IP. A fixed IP no service owns never lapses.
+     */
+    public function staticIpLapsed(?CarbonInterface $now = null): bool
+    {
+        if ($this->ip_id === null) {
+            return false;
+        }
+
+        return CustomerService::query()
+            ->where('account_id', $this->id)
+            ->where('ip_id', $this->ip_id)
+            ->whereNull('ended_at')
+            ->where('paid_until', '<=', $now ?? now())
+            ->whereHas('item', fn ($query) => $query->where('service_kind', ServiceKind::StaticIp->value))
+            ->exists();
+    }
+
+    /**
+     * The advance renewal waiting for the current period to end, if any (at most one).
+     *
+     * @return HasOne<AdvanceRenewal, $this>
+     */
+    public function waitingRenewal(): HasOne
+    {
+        return $this->hasOne(AdvanceRenewal::class)->where('status', AdvanceRenewalStatus::Waiting);
+    }
+
+    /**
+     * @return HasMany<NotificationLog, $this>
+     */
+    public function notificationLogs(): HasMany
+    {
+        return $this->hasMany(NotificationLog::class);
+    }
+}
