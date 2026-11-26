@@ -1,0 +1,84 @@
+@import 'tailwindcss';
+
+@source '../views';
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../vendor/livewire/livewire/src/Features/SupportPagination/views/*.blade.php';
+/* Installed add-ons: the installer builds the CSS again after every add-on change, so their classes exist too. */
+@source '../../vendor/ispgrid/*/resources/views';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Brand fonts (SIL Open Font License, see resources/fonts/OFL-*.txt), served by the app itself. */
+@font-face {
+    font-family: 'Geist';
+    src: url('../fonts/Geist.ttf') format('truetype');
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Hindi and other Devanagari text (Geist has none). The browser downloads it only for a page that shows Devanagari. */
+@font-face {
+    font-family: 'Noto Sans Devanagari';
+    src: url('../fonts/NotoSansDevanagari.ttf') format('truetype');
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+    unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+A830-A839, U+A8E0-A8FF;
+}
+
+@font-face {
+    font-family: 'JetBrains Mono';
+    src: url('../fonts/JetBrainsMono.ttf') format('truetype');
+    font-weight: 100 800;
+    font-style: normal;
+    font-display: swap;
+}
+
+@theme {
+    --font-sans: 'Geist', 'Noto Sans Devanagari', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* Brand palette. Signal Green is too light for text on white (2.3:1): use Deep Green there. */
+    --color-ink: #141414;
+    --color-signal: #22c55e;
+    --color-deep-green: #15803d;
+    --color-mint: #dcfce7;
+    --color-paper: #f6f6f3;
+
+    --color-zinc-50: #fafafa;
+    --color-zinc-100: #f5f5f5;
+    --color-zinc-200: #e5e5e5;
+    --color-zinc-300: #d4d4d4;
+    --color-zinc-400: #a3a3a3;
+    --color-zinc-500: #737373;
+    --color-zinc-600: #525252;
+    --color-zinc-700: #404040;
+    --color-zinc-800: #262626;
+    --color-zinc-900: #171717;
+    --color-zinc-950: #0a0a0a;
+}
+
+@layer base {
+    *,
+    ::after,
+    ::before,
+    ::backdrop,
+    ::file-selector-button {
+        border-color: var(--color-gray-200, currentColor);
+    }
+
+    /* Geist at 400 looks thin as dark text on a light background (above all on Windows), while light text on a dark
+       background looks heavier: light mode uses 450 (Geist is a variable font), dark mode keeps 400. */
+    body {
+        font-weight: 450;
+    }
+
+    .dark body {
+        font-weight: 400;
+    }
+}
+
+[x-cloak] {
+    display: none !important;
+}

@@ -1,0 +1,68 @@
+<?php
+
+namespace App\Models;
+
+use App\Enums\LoginResult;
+use Database\Factories\RadpostauthFactory;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+/**
+ * One login attempt as FreeRADIUS logged it (radpostauth): the result, the real reason, the router, the MAC and, for
+ * an accept, the IP its session was given (set by the radacct_login_ip trigger).
+ * The pass column is never shown (app-integration.md section 5).
+ */
+class Radpostauth extends Model
+{
+    /** @use HasFactory<RadpostauthFactory> */
+    use HasFactory;
+
+    protected $table = 'radpostauth';
+
+    public $timestamps = false;
+
+    /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return ['authdate' => 'datetime'];
+    }
+
+    public function result(): LoginResult
+    {
+        return LoginResult::fromReply((string) $this->reply, $this->reply_msg);
+    }
+
+    /**
+     * The reason as the panel shows it. isp says "Wrong Password" (older rows too), the other reasons are in
+     * sentence case.
+     */
+    public static function reasonText(?string $reason): string
+    {
+        return $reason === 'Wrong Password' ? 'Wrong password' : (string) $reason;
+    }
+
+    /**
+     * What the login tables show.
+     *
+     * @param  array<string, string>  $routers  router names by IP (Nas::names())
+     * @return array{id: int, username: string, when: string, result: string, color: string, reason: string, router: string, mac: string, ip: string}
+     */
+    public function forTable(array $routers, string $dateFormat): array
+    {
+        $result = $this->result();
+
+        return [
+            'id' => $this->id,
+            'username' => $this->username,
+            'when' => $this->authdate->format($dateFormat),
+            'result' => $result->label(),
+            'color' => $result->color(),
+            'reason' => self::reasonText($this->reply_msg),
+            'router' => $routers[(string) $this->nasipaddress] ?? (string) $this->nasipaddress,
+            'mac' => (string) $this->mac,
+            'ip' => (string) $this->framedipaddress,
+        ];
+    }
+}

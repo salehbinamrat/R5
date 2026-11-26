@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+
+    services:
+      mariadb:
+        # Ubuntu 24.04 ships MariaDB 10.11, the server the installer sets up.
+        image: mariadb:10.11
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: 'yes'
+          MARIADB_DATABASE: radius_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: '8.5'
+          extensions: mbstring, pdo_mysql, zip, intl
+          coverage: none
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Build assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Prepare the environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Code style
+        run: vendor/bin/pint --test
+
+      - name: Static analysis (Larastan)
+        run: vendor/bin/phpstan analyse --no-progress --memory-limit=1G
+
+      - name: Tests (MariaDB)
+        run: php artisan test
+
+  deploy:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck
+        run: |
+          shellcheck -x -S warning deploy/install.sh deploy/install/*.sh deploy/bin/ispgrid deploy/tests/installer/*.sh \
+            $(ls deploy/wireguard/*.sh deploy/backup/ispgrid-backup deploy/tests/radius_policy_tests.sh deploy/tests/radius_load_test.sh 2>/dev/null)
+
+      - name: Installer helper tests
+        run: bash deploy/tests/installer/test_install_sh.sh
+
+      - name: ispgrid command tests
+        run: bash deploy/tests/installer/test_ispgrid.sh
+
+      - name: sql module script tests
+        run: |
+          if [ -f deploy/tests/installer/test_configure_sql.py ]; then python3 deploy/tests/installer/test_configure_sql.py; fi

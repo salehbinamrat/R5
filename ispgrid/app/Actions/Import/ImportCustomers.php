@@ -1,0 +1,515 @@
+<?php
+
+namespace App\Actions\Import;
+
+use App\Actions\Radius\SyncAccountToRadius;
+use App\Billing\BillingSettings;
+use App\Billing\India\Gstin;
+use App\Billing\India\GstStates;
+use App\Enums\AccountStatus;
+use App\Enums\Permission;
+use App\Enums\ServiceType;
+use App\Exceptions\ImportFailed;
+use App\Models\Account;
+use App\Models\Address;
+use App\Models\ConnectionType;
+use App\Models\Ip;
+use App\Models\Plan;
+use App\Models\Pool;
+use App\Models\UsagePeriod;
+use App\Support\AccountNumbers;
+use App\Support\CsvFile;
+use App\Support\CustomerDefaults;
+use App\Support\CustomerRules;
+use App\Support\IpAddress;
+use App\Support\PhoneLength;
+use BackedEnum;
+use Carbon\CarbonImmutable;
+use Carbon\Exceptions\InvalidFormatException;
+use DateTimeInterface;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
+
+/**
+ * Customers from the customers template (Plan 9 spec): the customer form's rules, plus plan, expiry, status and
+ * a bound MAC from the file. Written through SyncAccountToRadius; nobody is disconnected, the accounts are new.
+ * The billing columns follow the form too: a blank one takes the form's default, and Free, discount and place of
+ * supply need Set customer pricing, auto renew the recharge permission.
+ */
+final class ImportCustomers implements Importer
+{
+    private const ADDRESS = ['line1', 'line2', 'area', 'city', 'state', 'postal_code', 'country'];
+
+    /**
+     * @var array<string, AccountStatus>
+     */
+    private const STATUSES = ['active' => AccountStatus::Active, 'inactive' => AccountStatus::Inactive, 'suspended' => AccountStatus::Suspended];
+
+    /**
+     * Customer form field => CSV column, where they differ (address.* fields drop their prefix).
+     *
+     * @var array<string, string>
+     */
+    private const COLUMN_OF = ['account_number' => 'account_id', 'mac_type' => 'device_limit', 'ip_address' => 'ip', 'pool_id' => 'pool', 'connection_type_id' => 'connection_type'];
+
+    public function __construct(private SyncAccountToRadius $sync) {}
+
+    public function columns(): array
+    {
+        return array_keys($this->example());
+    }
+
+    public function requiredColumns(): array
+    {
+        return ['username', 'service_type', 'fullname'];
+    }
+
+    public function example(): array
+    {
+        return [
+            'username' => 'alice', 'password' => 'secret12', 'service_type' => 'PPPoE', 'fullname' => 'Alice Rao',
+            'mobile' => '9876543210', 'email' => 'alice@example.com', 'company' => '', 'whatsapp' => '9876543210',
+            'alt_number' => '', 'tax_id' => '', 'business_id' => '', 'plan_slug' => 'home_25',
+            'expiry' => '2026-11-30 23:59', 'status' => 'Active', 'device_limit' => '1', 'ip' => '', 'mac' => '',
+            'pool' => '', 'connection_type' => 'Home', 'line1' => '12 Park Street', 'line2' => '', 'area' => 'Salt Lake',
+            'city' => 'Kolkata', 'state' => 'West Bengal', 'postal_code' => '700091', 'country' => 'India',
+            'auto_renew' => 'no', 'free' => 'no', 'discount_percent' => '0', 'payment_terms_days' => '7', 'billing_name' => '',
+            'place_of_supply' => '', 'account_id' => '',
+        ];
+    }
+
+    public function check(array $rows): array
+    {
+        return array_merge(...array_column($this->prepare($rows), 'errors'));
+    }
+
+    public function import(array $rows): int
+    {
+        try {
+            return DB::transaction(function () use ($rows): int {
+                $prepared = $this->prepare($rows);
+                $errors = array_merge(...array_column($prepared, 'errors'));
+
+                if ($errors !== []) {
+                    throw new ImportFailed($errors);
+                }
+
+                $typedIds = array_values(array_filter(array_map(fn (array $row): string => (string) ($row['columns']['account_number'] ?? ''), $prepared)));
+
+                foreach ($prepared as $row) {
+                    $this->write($row, $typedIds);
+                }
+
+                return count($prepared);
+            }, attempts: 3);
+        } catch (UniqueConstraintViolationException) {
+            throw new ImportFailed([new RowError(null, null, __('A record in this file was taken meanwhile by someone else. Check the file again.'))]);
+        }
+    }
+
+    /**
+     * @param  array{errors: list<RowError>, columns: array<string, mixed>, address: ?array<string, ?string>, mac: ?string}  $row
+     * @param  list<string>  $typedIds  the account IDs the file gives by hand, which numbering skips
+     */
+    private function write(array $row, array $typedIds): void
+    {
+        $columns = $row['columns'];
+        $columns['address_id'] = $row['address'] === null ? null : Address::query()->create($row['address'])->id;
+
+        // One "Imported" entry below instead of the model's own "Created" one.
+        $account = activity()->withoutLogging(fn (): Account => Account::query()->create($columns));
+        AccountNumbers::assign($account, $typedIds);
+
+        if ($account->usage_since !== null) {
+            UsagePeriod::restart($account->username, $account->usage_since);
+        }
+        $this->sync->handle($account);
+
+        // A device bound before the first login (app-integration.md section 6): FreeRADIUS reads it as bound.
+        if ($row['mac'] !== null) {
+            DB::table('account_macs')->insert(['username' => $account->username, 'mac_norm' => $row['mac'], 'learned_at' => now()]);
+        }
+
+        $this->logImported($account, $row['address'], $row['mac']);
+    }
+
+    /**
+     * Each row's problems and, when it has none, what to write.
+     *
+     * @param  list<array{line: int, values: array<string, string>}>  $rows
+     * @return list<array{errors: list<RowError>, columns: array<string, mixed>, address: ?array<string, ?string>, mac: ?string}>
+     */
+    private function prepare(array $rows): array
+    {
+        $phoneLength = PhoneLength::current();
+        $plans = Plan::query()->get(['id', 'slug'])->keyBy(fn (Plan $plan): string => strtolower($plan->slug));
+        $pools = Pool::query()->get(['id', 'name'])->keyBy(fn (Pool $pool): string => strtolower($pool->name));
+        $types = ConnectionType::query()->get(['id', 'name'])->keyBy(fn (ConnectionType $type): string => strtolower($type->name));
+        $settings = BillingSettings::current();
+        $seen = ['username' => [], 'ip' => [], 'mac' => [], 'account_id' => []];
+        $prepared = [];
+
+        foreach ($rows as ['line' => $line, 'values' => $values]) {
+            $prepared[] = $this->prepareRow($line, $values, $phoneLength, $plans, $pools, $types, $settings, $seen);
+        }
+
+        return $prepared;
+    }
+
+    /**
+     * @param  array<string, string>  $values
+     * @param  Collection<string, Plan>  $plans
+     * @param  Collection<string, Pool>  $pools
+     * @param  Collection<string, ConnectionType>  $types
+     * @param  array<string, array<string, int>>  $seen  the first row of each username, IP and MAC so far
+     * @return array{errors: list<RowError>, columns: array<string, mixed>, address: ?array<string, ?string>, mac: ?string}
+     */
+    private function prepareRow(int $line, array $values, PhoneLength $phoneLength, Collection $plans, Collection $pools, Collection $types, BillingSettings $settings, array &$seen): array
+    {
+        $errors = CsvFile::textErrors($values, ['fullname', 'company', 'billing_name', ...self::ADDRESS]);
+        // The panel says PPPoE, so the file may too; the stored value is PPP.
+        $serviceType = strtoupper($values['service_type']) === 'PPPOE' ? ServiceType::Ppp->value : strtoupper($values['service_type']);
+        $type = ServiceType::tryFrom($serviceType);
+        $isIpoe = $type === ServiceType::Ipoe;
+        $taxId = $settings->tax()->usesPlaceOfSupply() ? strtoupper($values['tax_id']) : $values['tax_id'];
+        $address = array_map(fn (string $value): ?string => $value === '' ? null : $value, Arr::only($values, self::ADDRESS));
+        $hasAddress = array_filter($address, fn (?string $value): bool => $value !== null) !== [];
+
+        foreach ($isIpoe ? ['username', 'account_id', 'mobile', 'whatsapp', 'alt_number'] : ['username', 'account_id', 'password', 'mobile', 'whatsapp', 'alt_number'] as $column) {
+            // Excel shows a long number such as 123456789012 as 1.23457E+11 and saves it that way.
+            if (preg_match('/^\d+(\.\d+)?E\+\d+$/i', $values[$column]) === 1) {
+                $errors[$column] = __('Excel turned this into a number. Format the column as Text in Excel and type it again.');
+            }
+        }
+
+        $pool = $values['pool'] === '' ? null : $pools->get(strtolower($values['pool']));
+
+        if ($values['pool'] !== '' && $isIpoe) {
+            $errors['pool'] = __('IPoE customers get no pool: their device keeps its own address.');
+        } elseif ($values['pool'] !== '' && $pool === null) {
+            $errors['pool'] = __('No pool named :name.', ['name' => $values['pool']]);
+        }
+
+        $connectionType = $values['connection_type'] === '' ? null : $types->get(strtolower($values['connection_type']));
+
+        if ($values['connection_type'] !== '' && $connectionType === null) {
+            $errors['connection_type'] = __('No connection type named :name.', ['name' => $values['connection_type']]);
+        }
+
+        $data = [
+            'fullname' => $values['fullname'],
+            'mobile' => $values['mobile'],
+            'email' => $values['email'],
+            'company' => $values['company'],
+            'whatsapp' => $values['whatsapp'],
+            'alt_number' => $values['alt_number'],
+            'tax_id' => $taxId,
+            'business_id' => $values['business_id'],
+            'address' => $address,
+            'service_type' => $serviceType,
+            'username' => $values['username'],
+            'account_number' => $values['account_id'],
+            'password' => $isIpoe ? '' : $values['password'],
+            'mac_type' => $values['device_limit'] === '' ? '1' : $values['device_limit'],
+            'connection_type_id' => $connectionType?->id,
+            'ip_address' => $values['ip'],
+            'pool_id' => $isIpoe ? null : $pool?->id,
+        ];
+        $rules = [...CustomerRules::rules(true, $isIpoe, $hasAddress, $phoneLength), 'account_number' => AccountNumbers::rules()];
+
+        $messages = [...CustomerRules::messages($phoneLength), 'account_number.unique' => __('Another customer has this account ID.'), 'account_number.regex' => __('Use letters, digits and / . _ - only.')];
+
+        foreach (Validator::make($data, $rules, $messages, self::attributeNames())->errors()->messages() as $field => $messages) {
+            $column = str_starts_with($field, 'address.') ? substr($field, 8) : (self::COLUMN_OF[$field] ?? $field);
+            $errors[$column] ??= $messages[0];
+        }
+
+        $ip = IpAddress::normalize($values['ip']) ?? '';
+        $ipError = isset($errors['ip']) ? null : CustomerRules::ipError($ip, null, $isIpoe);
+
+        if ($ipError !== null) {
+            $errors['ip'] = $ipError;
+        }
+
+        $plan = $values['plan_slug'] === '' ? null : $plans->get(strtolower($values['plan_slug']));
+        $expiry = $this->expiry($values['expiry']);
+        $status = $values['status'] === '' ? AccountStatus::Inactive : (self::STATUSES[strtolower($values['status'])] ?? null);
+        $errors = [...$errors, ...$this->planErrors($values, $plan, $expiry, $status)];
+        $billing = $this->billing($values, $taxId, $plan, $settings);
+        $errors = [...$errors, ...$billing['errors']];
+
+        $mac = strtoupper(str_replace([':', '-', '.'], '', $values['mac']));
+
+        if ($values['mac'] !== '' && preg_match('/^[0-9A-F]{12}$/', $mac) !== 1) {
+            $errors['mac'] = __('Enter a MAC address, e.g. AA:BB:CC:DD:EE:FF.');
+        } elseif ($values['mac'] !== '') {
+            $owner = DB::table('account_macs')->where('mac_norm', $mac)->value('username');
+
+            if ($owner !== null) {
+                $errors['mac'] = __(':username already uses this device.', ['username' => $owner]);
+            }
+        }
+
+        $keys = ['username' => strtolower($values['username']), 'account_id' => strtolower($values['account_id']), 'ip' => $ip, 'mac' => isset($errors['mac']) ? '' : ($values['mac'] === '' ? '' : $mac)];
+
+        foreach ($keys as $column => $key) {
+            if ($key === '') {
+                continue;
+            }
+
+            if (isset($seen[$column][$key])) {
+                $errors[$column] ??= match ($column) {
+                    'username' => __('Row :row already uses this username.', ['row' => $seen[$column][$key]]),
+                    'ip' => __('Row :row already uses this IP address.', ['row' => $seen[$column][$key]]),
+                    'account_id' => __('Row :row already uses this account ID.', ['row' => $seen[$column][$key]]),
+                    default => __('Row :row already uses this MAC address.', ['row' => $seen[$column][$key]]),
+                };
+            }
+
+            $seen[$column][$key] ??= $line;
+        }
+
+        return [
+            'errors' => array_map(
+                fn (string $column, string $message): RowError => new RowError($line, $column, $message),
+                array_keys($errors),
+                array_values($errors),
+            ),
+            'columns' => [
+                'username' => $values['username'],
+                'account_number' => $values['account_id'] === '' ? null : $values['account_id'],
+                'password' => $isIpoe ? Str::random(16) : $values['password'],
+                'fullname' => $values['fullname'],
+                'mobile' => $values['mobile'] === '' ? null : $values['mobile'],
+                'email' => $values['email'] === '' ? null : $values['email'],
+                'company' => $values['company'] === '' ? null : $values['company'],
+                'whatsapp' => $values['whatsapp'] === '' ? null : $values['whatsapp'],
+                'alt_number' => $values['alt_number'] === '' ? null : $values['alt_number'],
+                'tax_id' => $taxId === '' ? null : $taxId,
+                'business_id' => $values['business_id'] === '' ? null : $values['business_id'],
+                ...$billing['columns'],
+                'service_type' => $type,
+                'mac_type' => $isIpoe ? 1 : (int) $data['mac_type'],
+                'plan_id' => $plan?->id,
+                'expiry' => $expiry,
+                'usage_since' => $plan === null ? null : now(),
+                'status_id' => $status ?? AccountStatus::Inactive,
+                'ip_id' => $ip === '' ? null : Ip::query()->where('address', $ip)->value('id'),
+                'pool_id' => $isIpoe || $type === null ? null : ($pool->id ?? CustomerDefaults::poolId($type)),
+                'connection_type_id' => $connectionType?->id,
+            ],
+            'address' => $hasAddress ? $address : null,
+            'mac' => $values['mac'] === '' ? null : $mac,
+        ];
+    }
+
+    /**
+     * Auto renew, Free, discount, payment terms, billing name and place of supply, checked as the customer form
+     * checks them, with the form's defaults for blank cells. These replace earlier errors of the same columns.
+     *
+     * @param  array<string, string>  $values
+     * @return array{errors: array<string, string>, columns: array<string, mixed>}
+     */
+    private function billing(array $values, string $taxId, ?Plan $plan, BillingSettings $settings): array
+    {
+        $errors = [];
+        $autoRenew = $this->yesNo($values['auto_renew']);
+        $free = $this->yesNo($values['free']);
+        $discount = $values['discount_percent'] === '' ? '0' : $values['discount_percent'];
+        $terms = $values['payment_terms_days'] === '' ? (string) $settings->defaultTermsDays : $values['payment_terms_days'];
+        $usesGst = $settings->tax()->usesPlaceOfSupply();
+
+        foreach (['auto_renew' => $autoRenew, 'free' => $free] as $column => $value) {
+            if ($value === null) {
+                $errors[$column] = __('Use yes or no.');
+            }
+        }
+
+        $validator = Validator::make(['discount_percent' => $discount, 'payment_terms_days' => $terms, 'billing_name' => $values['billing_name']], [
+            'discount_percent' => ['required', 'numeric', 'between:0,100', 'decimal:0,2'],
+            'payment_terms_days' => ['required', 'integer', 'between:0,365'],
+            'billing_name' => ['nullable', 'string', 'max:150'],
+        ]);
+
+        foreach ($validator->errors()->messages() as $field => $messages) {
+            $errors[$field] = $messages[0];
+        }
+
+        if ($usesGst && $taxId !== '' && ! Gstin::isValid($taxId)) {
+            $errors['tax_id'] = __('Enter a valid GSTIN, e.g. 09ABCDE1234F1Z5.');
+        }
+
+        $place = null;
+
+        if ($values['place_of_supply'] !== '' && ! $usesGst) {
+            $errors['place_of_supply'] = __('A place of supply is only used with India GST.');
+        } elseif ($values['place_of_supply'] !== '' && $taxId === '') {
+            $errors['place_of_supply'] = __('A place of supply needs a GSTIN.');
+        } elseif ($usesGst && $taxId !== '') {
+            $place = $values['place_of_supply'] === '' ? (string) ($settings->taxConfig['state'] ?? '') : $this->stateCode($values['place_of_supply']);
+
+            if ($place === null) {
+                $errors['place_of_supply'] = __('No state named :name.', ['name' => $values['place_of_supply']]);
+            }
+        }
+
+        if ($autoRenew === true && $plan?->hotspot_starts_at_first_login) {
+            $errors['auto_renew'] = __('This plan starts at the first Hotspot login, so it cannot renew by itself.');
+        }
+
+        $canPrice = Gate::allows(Permission::SetCustomerPricing->value);
+
+        if (! $canPrice) {
+            $set = ['free' => $free === true, 'discount_percent' => is_numeric($discount) && (float) $discount !== 0.0, 'place_of_supply' => $values['place_of_supply'] !== ''];
+
+            foreach (array_keys(array_filter($set)) as $column) {
+                $errors[$column] = __('You may not set customer pricing.');
+            }
+        }
+
+        if ($autoRenew === true && ! Gate::allows(Permission::RechargeCustomers->value)) {
+            $errors['auto_renew'] = __('You may not recharge customers, so auto renew stays off.');
+        }
+
+        return ['errors' => $errors, 'columns' => [
+            'auto_renew' => $autoRenew ?? false,
+            'billing_free' => $canPrice && $free === true,
+            'discount_percent' => $canPrice && is_numeric($discount) ? $discount : '0',
+            'payment_terms_days' => (int) $terms,
+            'billing_name' => $values['billing_name'] === '' ? null : $values['billing_name'],
+            'place_of_supply' => $canPrice && $place !== '' ? $place : null,
+        ]];
+    }
+
+    /**
+     * Yes or no in the usual spellings; a blank cell is no, anything else null.
+     */
+    private function yesNo(string $value): ?bool
+    {
+        return match (strtolower($value)) {
+            '', 'no', 'n', 'false', '0' => false,
+            'yes', 'y', 'true', '1' => true,
+            default => null,
+        };
+    }
+
+    /**
+     * A GST state by its code ("7" or "07") or by its name in any case, else null.
+     */
+    private function stateCode(string $value): ?string
+    {
+        if (ctype_digit($value)) {
+            $code = str_pad($value, 2, '0', STR_PAD_LEFT);
+
+            return GstStates::has($code) ? $code : null;
+        }
+
+        foreach (GstStates::options() as $state) {
+            if (strcasecmp($state['name'], $value) === 0) {
+                return $state['code'];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * A plan needs an expiry and an expiry needs a plan; Active needs both. These replace earlier errors of the
+     * same columns.
+     *
+     * @param  array<string, string>  $values
+     * @return array<string, string>
+     */
+    private function planErrors(array $values, ?Plan $plan, ?CarbonImmutable $expiry, ?AccountStatus $status): array
+    {
+        $errors = [];
+
+        if ($values['plan_slug'] !== '' && $plan === null) {
+            $errors['plan_slug'] = __('No plan with this slug.');
+        }
+
+        if ($values['expiry'] !== '' && $expiry === null) {
+            $errors['expiry'] = __('Use YYYY-MM-DD HH:MM, e.g. 2026-11-30 23:59.');
+        } elseif ($values['expiry'] !== '' && $values['plan_slug'] === '') {
+            $errors['expiry'] = __('Give a plan with the expiry.');
+        } elseif ($values['plan_slug'] !== '' && $values['expiry'] === '') {
+            $errors['expiry'] = __('Give the expiry for this plan.');
+        }
+
+        if ($status === null) {
+            $errors['status'] = __('Use Active, Inactive or Suspended.');
+        } elseif ($status === AccountStatus::Active && ($values['plan_slug'] === '' || $values['expiry'] === '')) {
+            $errors['status'] = __('An Active customer needs a plan and an expiry.');
+        }
+
+        return $errors;
+    }
+
+    /**
+     * The CSV column each message names, e.g. "The device limit field ..." rather than "The mac type field ...".
+     *
+     * @return array<string, string>
+     */
+    private static function attributeNames(): array
+    {
+        $columns = self::COLUMN_OF + array_combine(array_map(fn (string $column): string => 'address.'.$column, self::ADDRESS), self::ADDRESS);
+
+        return array_map(fn (string $column): string => str_replace('_', ' ', $column), $columns);
+    }
+
+    /**
+     * "YYYY-MM-DD HH:MM" or "YYYY-MM-DD" (midnight). A date that does not exist (2026-02-30) is refused, not
+     * rolled over.
+     */
+    private function expiry(string $value): ?CarbonImmutable
+    {
+        foreach (['Y-m-d H:i', 'Y-m-d'] as $format) {
+            try {
+                $date = CarbonImmutable::createFromFormat('!'.$format, $value);
+            } catch (InvalidFormatException) {
+                continue;
+            }
+
+            if ($date instanceof CarbonImmutable && $date->format($format) === $value) {
+                return $date;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * One "Imported" entry with the customer's logged columns (never the password), their address and the bound
+     * device, like the form's "Created" entry.
+     *
+     * @param  ?array<string, ?string>  $address
+     */
+    private function logImported(Account $account, ?array $address, ?string $mac): void
+    {
+        $attributes = [];
+
+        foreach ($account->getActivitylogOptions()->logAttributes as $field) {
+            $value = $account->getAttribute($field);
+            $attributes[$field] = match (true) {
+                $value instanceof BackedEnum => $value->value,
+                $value instanceof DateTimeInterface => $value->format('Y-m-d H:i:s'),
+                default => $value,
+            };
+        }
+
+        if ($address !== null) {
+            $attributes['address'] = implode(', ', array_filter($address, fn (?string $value): bool => $value !== null));
+        }
+
+        if ($mac !== null) {
+            $attributes['mac'] = implode(':', str_split($mac, 2));
+        }
+
+        activity()->performedOn($account)->event('imported')->withChanges(['attributes' => $attributes])->log('imported');
+    }
+}

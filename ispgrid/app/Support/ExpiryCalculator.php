@@ -1,0 +1,57 @@
+<?php
+
+namespace App\Support;
+
+use App\Enums\ValidityUnit;
+use App\Models\AppSetting;
+use Carbon\CarbonImmutable;
+use Carbon\CarbonInterface;
+
+/**
+ * The expiry a recharge gives (spec section 4): the plan's validity added to the current expiry while it is still
+ * ahead, otherwise to now. In "midnight" mode it moves on to the end of the last day (00:00 after it). Hours are
+ * added as elapsed hours, and midnight mode applies to days only (a 3-hour plan bought at 10:00 ends at 13:00).
+ * Staff can change the result before saving.
+ */
+final class ExpiryCalculator
+{
+    /**
+     * @param  string  $mode  'exact' or 'midnight' (app setting expiry_mode)
+     */
+    public function __construct(private string $mode) {}
+
+    public static function fromSettings(): self
+    {
+        return new self((string) AppSetting::valueOf('expiry_mode', 'midnight'));
+    }
+
+    /**
+     * The modes staff choose from, by key; midnight (the default on new installs) first.
+     *
+     * @return array<string, string>
+     */
+    public static function modes(): array
+    {
+        return [
+            'midnight' => __('At midnight at the end of the last day'),
+            'exact' => __('At the recharge time on the last day'),
+        ];
+    }
+
+    public function next(?CarbonInterface $currentExpiry, int $validity, ValidityUnit $unit, CarbonInterface $now): CarbonImmutable
+    {
+        $base = CarbonImmutable::instance($currentExpiry !== null && $currentExpiry->greaterThan($now) ? $currentExpiry : $now);
+
+        if ($unit === ValidityUnit::Hours) {
+            return $base->addHours($validity)->startOfMinute();
+        }
+
+        $expiry = $base->addDays($validity)->startOfMinute();
+
+        if ($this->mode === 'midnight' && $expiry->notEqualTo($expiry->startOfDay())) {
+            return $expiry->addDay()->startOfDay();
+        }
+
+        return $expiry;
+    }
+}

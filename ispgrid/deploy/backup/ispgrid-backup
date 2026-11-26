@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+#  ISPGrid backup: the radius database, the add-on databases (ispgrid_*, e.g. the session records archive), the add-on
+#  files (each directory under /opt/ispgrid/storage/app/private/addons), the invoice logos
+#  (/opt/ispgrid/storage/app/private/billing), and the config that belongs to them (FreeRADIUS, the panel's .env with its APP_KEY, the add-on list, the WireGuard keys, the
+#  L2TP/IPsec key and logins), in /var/backups/ispgrid, kept 14 days. Prints the radius dump's path last.
+#  Copy /var/backups/ispgrid to another machine: a backup on the same disk does not survive the disk.
+#
+#  Restore, on a server installed with the same ISPGrid version:
+#    1. systemctl stop freeradius ispgrid-queue
+#       runuser -u ispgrid -- php /opt/ispgrid/artisan down
+#    2. gunzip < /var/backups/ispgrid/radius-YYYYMMDD-HHMM.sql.gz | mysql radius
+#       and each add-on dump, e.g.: mysql -e 'CREATE DATABASE IF NOT EXISTS ispgrid_ipdr'
+#       gunzip < /var/backups/ispgrid/ispgrid_ipdr-YYYYMMDD-HHMM.sql.gz | mysql ispgrid_ipdr
+#    3. tar -xzf /var/backups/ispgrid/config-YYYYMMDD-HHMM.tgz -C /
+#       and each add-on's files, e.g.: tar -xzf /var/backups/ispgrid/files-documents-YYYYMMDD-HHMM.tgz -C /
+#       and the invoice logos: tar -xzf /var/backups/ispgrid/files-core-billing-YYYYMMDD-HHMM.tgz -C /
+#    4. sudo /opt/ispgrid/deploy/install.sh --yes
+#       The dump holds no MariaDB users: the installer sets their passwords to the restored ones (.env and the
+#       FreeRADIUS sql module), restarts the services (and the tunnels) and brings the panel back up.
+#
+set -euo pipefail
+dir=/var/backups/ispgrid
+keep_days=14
+stamp=$(date +%Y%m%d-%H%M)
+umask 077
+install -d -m 700 "$dir"
+
+mysqldump --single-transaction --routines --triggers radius | gzip > "$dir/radius-$stamp.sql.gz.part"
+mv "$dir/radius-$stamp.sql.gz.part" "$dir/radius-$stamp.sql.gz"
+
+#  Add-on databases (e.g. ispgrid_ipdr, the session records archive) next to radius.
+mapfile -t addon_dbs < <(mysql -N -e "SHOW DATABASES LIKE 'ispgrid\\_%'")
+for db in "${addon_dbs[@]}"; do
+  mysqldump --single-transaction --routines --triggers "$db" | gzip > "$dir/$db-$stamp.sql.gz.part"
+  mv "$dir/$db-$stamp.sql.gz.part" "$dir/$db-$stamp.sql.gz"
+done
+
+#  Add-on files (extra.ispgrid.paths), one archive per directory, so one add-on's files can be restored or deleted alone.
+addon_files=/opt/ispgrid/storage/app/private/addons
+if [[ -d "$addon_files" ]]; then
+  for path in "$addon_files"/*/; do
+    [[ -d "$path" ]] || continue
+    name=$(basename "$path")
+    #  Files may change while they are read (an upload): GNU tar then exits 1 with a complete archive; only worse fails.
+    tar -czf "$dir/files-$name-$stamp.tgz.part" -C / --warning=no-file-changed "${addon_files#/}/$name" || [[ $? -eq 1 ]]
+    mv "$dir/files-$name-$stamp.tgz.part" "$dir/files-$name-$stamp.tgz"
+  done
+fi
+
+#  Core billing files (the invoice logos; issued invoices point at them, so none is ever deleted).
+billing_files=/opt/ispgrid/storage/app/private/billing
+if [[ -d "$billing_files" ]]; then
+  tar -czf "$dir/files-core-billing-$stamp.tgz.part" -C / --warning=no-file-changed "${billing_files#/}" || [[ $? -eq 1 ]]
+  mv "$dir/files-core-billing-$stamp.tgz.part" "$dir/files-core-billing-$stamp.tgz"
+fi
+
+paths=(etc/freeradius)
+[[ -f /opt/ispgrid/.env ]] && paths+=(opt/ispgrid/.env)
+[[ -f /opt/ispgrid/addons.json ]] && paths+=(opt/ispgrid/addons.json)
+[[ -f /etc/ispgrid/addon-data.json ]] && paths+=(etc/ispgrid/addon-data.json)
+[[ -d /etc/wireguard ]] && paths+=(etc/wireguard)
+[[ -f /etc/swanctl/conf.d/ispgrid-l2tp-secret.conf ]] && paths+=(etc/swanctl/conf.d/ispgrid-l2tp-secret.conf etc/ppp/chap-secrets)
+tar -czf "$dir/config-$stamp.tgz" -C / "${paths[@]}"
+
+find "$dir" -maxdepth 1 -type f \( -name '*.sql.gz' -o -name 'config-*.tgz' -o -name 'files-*.tgz' \) -mtime +"$((keep_days - 1))" -delete
+
+#  The finish time (UTC) for the dashboard, which cannot read this directory.
+finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mysql radius -e "INSERT INTO app_settings (\`key\`, value, created_at, updated_at) VALUES ('backup.last_finished_at', '$finished', NOW(), NOW())
+  ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = NOW()" || echo "Could not record the backup time for the dashboard." >&2
+echo "$dir/radius-$stamp.sql.gz"

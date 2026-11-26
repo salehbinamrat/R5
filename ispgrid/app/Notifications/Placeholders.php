@@ -1,0 +1,205 @@
+<?php
+
+namespace App\Notifications;
+
+use App\Models\Account;
+use App\Models\AppSetting;
+use App\Models\CustomerService;
+use App\Models\NotificationLog;
+use App\Models\Recharge;
+use App\Notifications\Contracts\LimitsValueLength;
+use App\Notifications\Contracts\Provider;
+use App\Payments\PayCode;
+use App\Payments\QuickPay;
+use App\Support\Selfcare;
+use Carbon\CarbonImmutable;
+use Carbon\CarbonInterface;
+
+/**
+ * The values a rule can put into a template, in the order the rule lists them. For a provider that limits value
+ * length (MSG91: 30 characters, the DLT limit) each is cut to that, except a link (half a link does not open).
+ */
+final class Placeholders
+{
+    /** Values every customer has. */
+    public const COMMON = ['customer_name', 'username', 'mobile', 'plan_name', 'plan_speed', 'plan_price',
+        'expiry_date', 'expiry_datetime', 'days_left', 'isp_name', 'support_number', 'pay_code', 'pay_link'];
+
+    /** Values only WhatsApp rules get: never cut, so too long for a DLT variable. */
+    public const WHATSAPP_ONLY = ['pay_link', 'selfcare_url'];
+
+    /** Values only a recharge has. */
+    public const RECHARGE = ['amount_paid', 'recharge_reference', 'recharge_note', 'recharge_date', 'recharge_datetime'];
+
+    /** Values that carry a new password: held apart, encrypted, until the send is final (NotificationLog). */
+    public const SECRETS = ['selfcare_password', 'pppoe_password'];
+
+    /** Values only a payment has. */
+    public const PAYMENT = ['payment_amount', 'receipt_number', 'invoice_number', 'payment_method', 'balance_due'];
+
+    /** Values only a customer service (a static IP, OTT) has. */
+    public const SERVICE = ['service', 'service_expiry', 'static_ip'];
+
+    /** @var array<string, string> */
+    private array $settings = [];
+
+    /**
+     * @return array<string, string>
+     */
+    public static function labels(): array
+    {
+        return [
+            'customer_name' => __('Customer name'),
+            'username' => __('Username'),
+            'mobile' => __('Mobile'),
+            'plan_name' => __('Plan name'),
+            'plan_speed' => __('Plan speed'),
+            'plan_price' => __('Plan price'),
+            'amount_paid' => __('Amount paid'),
+            'recharge_reference' => __('Recharge reference'),
+            'recharge_note' => __('Recharge note'),
+            'recharge_date' => __('Recharge date'),
+            'recharge_datetime' => __('Recharge date and time'),
+            'expiry_date' => __('Expiry date'),
+            'expiry_datetime' => __('Expiry date and time'),
+            'days_left' => __('Days left'),
+            'isp_name' => __('ISP name'),
+            'support_number' => __('Support number'),
+            'payment_amount' => __('Payment amount'),
+            'receipt_number' => __('Receipt number'),
+            'invoice_number' => __('Invoice number'),
+            'payment_method' => __('Payment method'),
+            'balance_due' => __('Balance due'),
+            'pay_code' => __('Pay code'),
+            'pay_link' => __('Pay link'),
+            'selfcare_url' => __('Selfcare address'),
+            'selfcare_password' => __('Selfcare password'),
+            'pppoe_password' => __('PPPoE password'),
+            'service' => __('Service'),
+            'service_expiry' => __('Service expiry'),
+            'static_ip' => __('Static IP'),
+        ];
+    }
+
+    /**
+     * @param  list<string>  $keys
+     * @param  ?int  $maxLength  the provider's limit for one value (maxLengthFor()), or null to keep values whole
+     * @return array{values: list<string>, trimmed: bool}
+     */
+    public function values(array $keys, ?Account $account, ?Recharge $recharge, CarbonImmutable $now, ?PaymentNotice $payment = null, ?CustomerService $service = null, ?int $maxLength = null): array
+    {
+        $values = [];
+        $trimmed = false;
+
+        foreach ($keys as $key) {
+            $value = $account === null ? '['.(self::labels()[$key] ?? $key).']' : $this->resolve($key, $account, $recharge, $now, $payment, $service);
+
+            if ($maxLength !== null && mb_strlen($value) > $maxLength && ! in_array($key, self::WHATSAPP_ONLY, true)) {
+                $value = mb_substr($value, 0, $maxLength);
+                $trimmed = true;
+            }
+
+            $values[] = $value;
+        }
+
+        return ['values' => $values, 'trimmed' => $trimmed];
+    }
+
+    /**
+     * The limit for one value of this provider, or null when it takes values of any length.
+     *
+     * @param  ?class-string<Provider>  $provider
+     */
+    public static function maxLengthFor(?string $provider): ?int
+    {
+        return $provider !== null && is_subclass_of($provider, LimitsValueLength::class) ? $provider::maxValueLength() : null;
+    }
+
+    /**
+     * The approved text with {1}, {2}, ... replaced by the values.
+     *
+     * @param  list<string>  $values
+     */
+    public static function preview(?string $approvedText, array $values): ?string
+    {
+        if ($approvedText === null || $approvedText === '') {
+            return null;
+        }
+
+        $pairs = [];
+
+        foreach ($values as $index => $value) {
+            $pairs['{'.($index + 1).'}'] = $value;
+        }
+
+        return strtr($approvedText, $pairs);
+    }
+
+    private function resolve(string $key, Account $account, ?Recharge $recharge, CarbonImmutable $now, ?PaymentNotice $payment, ?CustomerService $service): string
+    {
+        $plan = $account->plan;
+        $expiry = $account->expiry;
+        $rechargedAt = $recharge?->created_at;
+
+        return match ($key) {
+            'customer_name' => (string) ($account->fullname ?: $account->username),
+            'username' => (string) $account->username,
+            'mobile' => (string) $account->mobile,
+            'plan_name' => (string) $plan?->name,
+            'plan_speed' => (string) $plan?->download,
+            'plan_price' => $plan === null ? '' : $this->amount((string) $plan->price),
+            'amount_paid' => $recharge === null ? '' : $this->amount((string) $recharge->amount),
+            'recharge_reference' => $recharge === null ? '' : (string) $recharge->id,
+            'recharge_note' => (string) $recharge?->note,
+            'recharge_date' => $rechargedAt === null ? '' : $rechargedAt->format($this->dateFormat()),
+            'recharge_datetime' => $rechargedAt === null ? '' : $rechargedAt->format($this->dateTimeFormat()),
+            'expiry_date' => $expiry === null ? '' : $expiry->format($this->dateFormat()),
+            'expiry_datetime' => $expiry === null ? '' : $expiry->format($this->dateTimeFormat()),
+            'days_left' => $expiry === null ? '' : (string) $this->daysLeft($now, $expiry),
+            'isp_name' => $this->setting('notice_isp_name', ''),
+            'support_number' => $this->setting('notice_phone', ''),
+            'payment_amount' => $payment === null ? '' : $this->amount($payment->amount),
+            'receipt_number' => (string) $payment?->receipts,
+            'invoice_number' => (string) $payment?->invoices,
+            'payment_method' => (string) $payment?->method,
+            'balance_due' => $payment === null ? '' : $this->amount($payment->balanceDue),
+            'pay_code' => QuickPay::isOpen() ? PayCode::for($account->id) : '',
+            'pay_link' => QuickPay::isOpen() ? route('pay.code', PayCode::for($account->id)) : '',
+            'selfcare_url' => Selfcare::url(),
+            // The password itself never enters the values: the log row holds it apart, encrypted (Notifier::fire).
+            'selfcare_password', 'pppoe_password' => NotificationLog::SECRET_MASK,
+            'service' => (string) $service?->item?->name,
+            'service_expiry' => $service === null ? '' : $service->paid_until->format($this->dateFormat()),
+            'static_ip' => $service !== null && $service->isStaticIp() ? (string) $service->ip?->address : '',
+            default => '',
+        };
+    }
+
+    /**
+     * Calendar days from today to the expiry day, never below zero.
+     */
+    private function daysLeft(CarbonImmutable $now, CarbonInterface $expiry): int
+    {
+        return max(0, (int) $now->startOfDay()->diffInDays(CarbonImmutable::instance($expiry)->startOfDay(), false));
+    }
+
+    private function dateFormat(): string
+    {
+        return $this->setting('notify_date_format', 'd-M-Y');
+    }
+
+    private function dateTimeFormat(): string
+    {
+        return $this->dateFormat().' '.$this->setting('notify_time_format', 'h:iA');
+    }
+
+    private function amount(string $amount): string
+    {
+        return number_format((float) $amount, (int) $this->setting('currency_decimals', '2'), '.', '');
+    }
+
+    private function setting(string $key, string $default): string
+    {
+        return $this->settings[$key] ??= (string) AppSetting::valueOf($key, $default);
+    }
+}

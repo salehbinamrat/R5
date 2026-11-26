@@ -1,0 +1,143 @@
+<?php
+
+use App\Contracts\UntestedGateway;
+use App\Enums\Permission;
+use App\Models\AppSetting;
+use App\Models\GatewaySetting;
+use App\Payments\PaymentGateways;
+use App\Payments\Stripe\StripeGateway;
+use Livewire\Livewire;
+use Spatie\Activitylog\Models\Activity;
+use Tests\Fakes\UntestedFakeGateway;
+
+beforeEach(function () {
+    turnInvoicingOn();
+    $this->actingAs(staffHolding(Permission::ManageBilling));
+});
+
+it('is for staff with Billing settings only', function () {
+    $this->get(route('online-payments.edit'))->assertOk()->assertSee('Paytm');
+
+    $this->actingAs(staffHolding(Permission::ViewInvoices));
+    $this->get(route('online-payments.edit'))->assertForbidden();
+});
+
+it('saves Paytm keys encrypted, never shows the key again and keeps it when left empty', function () {
+    $page = Livewire::test('pages::system.online-payments')
+        ->set('enabled.paytm', true)
+        ->set('settings.paytm.environment', 'test')
+        ->set('settings.paytm.mid', 'TESTMID')
+        ->set('settings.paytm.merchant_key', 'secret#Key')
+        ->call('save', 'paytm')
+        ->assertHasNoErrors()
+        ->assertSet('settings.paytm.merchant_key', '')
+        ->assertDontSee('secret#Key')
+        ->assertSee(__('Saved. Leave empty to keep it.'));
+
+    $page->set('settings.paytm.mid', 'TESTMID2')->call('save', 'paytm')->assertHasNoErrors();
+
+    expect(GatewaySetting::settingsFor('paytm'))->toMatchArray(['mid' => 'TESTMID2', 'merchant_key' => 'secret#Key'])
+        ->and(DB::table('payment_gateways')->value('settings'))->not->toContain('secret#Key')
+        ->and(json_encode(Activity::query()->pluck('attribute_changes')))->not->toContain('secret#Key');
+});
+
+it('checks the Paytm fields and the currency', function () {
+    Livewire::test('pages::system.online-payments')
+        ->set('settings.paytm.environment', 'prod')
+        ->set('settings.paytm.host', 'not a url')
+        ->call('save', 'paytm')
+        ->assertHasErrors(['settings.paytm.environment', 'settings.paytm.mid', 'settings.paytm.merchant_key', 'settings.paytm.host']);
+
+    AppSetting::put('currency_code', 'USD');
+    Livewire::test('pages::system.online-payments')
+        ->assertSee(__('This gateway does not take the currency set in App settings.'))
+        ->set('enabled.paytm', true)
+        ->set('settings.paytm.environment', 'test')
+        ->set('settings.paytm.mid', 'M')
+        ->set('settings.paytm.merchant_key', 'K')
+        ->call('save', 'paytm')
+        ->assertHasErrors('enabled.paytm');
+});
+
+it('takes only an https Paytm address', function () {
+    Livewire::test('pages::system.online-payments')
+        ->set('settings.paytm.environment', 'test')->set('settings.paytm.mid', 'M')->set('settings.paytm.merchant_key', 'K')
+        ->set('settings.paytm.host', 'http://securestage.paytmpayments.com')
+        ->call('save', 'paytm')
+        ->assertHasErrors('settings.paytm.host');
+});
+
+it('marks the fields a gateway does not need as optional', function () {
+    Livewire::test('pages::system.online-payments')
+        ->assertSee(__(':label (optional)', ['label' => __('Paytm address')]))
+        ->assertDontSee(__(':label (optional)', ['label' => __('Merchant ID (MID)')]));
+});
+
+it('opens the pay page only with invoicing and a gateway on', function () {
+    Livewire::test('pages::system.online-payments')
+        ->set('quick_pay', true)
+        ->call('saveQuickPay')
+        ->assertHasErrors('quick_pay');
+
+    GatewaySetting::query()->create(['gateway' => 'paytm', 'enabled' => true, 'settings' => ['environment' => 'test', 'mid' => 'M', 'merchant_key' => 'K']]);
+
+    Livewire::test('pages::system.online-payments')
+        ->set('quick_pay', true)
+        ->set('renewal_days', '61')
+        ->call('saveQuickPay')
+        ->assertHasErrors('renewal_days')
+        ->set('renewal_days', '10')
+        ->call('saveQuickPay')
+        ->assertHasNoErrors()
+        ->assertSee(route('pay.show'))
+        ->assertSee(route('pay.webhook', 'paytm'));
+
+    expect(AppSetting::valueOf('billing.quick_pay'))->toBe('1')
+        ->and(AppSetting::valueOf('billing.quick_pay_renewal_days'))->toBe('10')
+        ->and(Activity::query()->where('event', 'quick-pay-settings')->exists())->toBeTrue();
+
+    $this->get(route('pay.show'))->assertOk();
+
+    AppSetting::put('billing.enabled', '0');
+    Livewire::test('pages::system.online-payments')->call('saveQuickPay')->assertHasErrors('quick_pay');
+});
+
+it('warns when the panel is not on https', function () {
+    config(['app.url' => 'http://panel.example']);
+    Livewire::test('pages::system.online-payments')->assertSee(__('The panel address does not start with https://. Payment gateways send customers back only to an https address: install with a domain first.'));
+
+    config(['app.url' => 'https://panel.example']);
+    Livewire::test('pages::system.online-payments')->assertDontSee('does not start with https://');
+});
+
+it('warns on the card of a gateway not yet tested with a live account, and only there', function () {
+    app(PaymentGateways::class)->register(UntestedFakeGateway::class);
+
+    $page = Livewire::test('pages::system.online-payments')
+        ->assertSee('Untested gateway')
+        ->assertSee(__('Not yet tested with a live account. Make a small payment first.'));
+
+    // One warning per registered UntestedGateway, none on a tested gateway's card (Paytm).
+    $untested = collect(app(PaymentGateways::class)->all())->filter(fn (string $class): bool => is_subclass_of($class, UntestedGateway::class))->count();
+    expect($untested)->toBeGreaterThan(1)
+        ->and(substr_count($page->html(), __('Not yet tested with a live account. Make a small payment first.')))->toBe($untested);
+});
+
+it('offers the gateway environment as a list of Test and Live', function () {
+    $html = Livewire::test('pages::system.online-payments')->html();
+
+    expect($html)->toMatch('/<select\s+id="field-settings-paytm-environment"/')
+        ->and($html)->toMatch('/<select\s+id="field-settings-stripe-environment"/')
+        ->and($html)->toContain('<option value="test"')
+        ->and($html)->toContain('<option value="live"');
+});
+
+it('keeps a long currency list out of the gateway badge', function () {
+    $stripe = collect(Livewire::test('pages::system.online-payments')->instance()->gatewayCards)->firstWhere('key', 'stripe');
+    $paytm = collect(Livewire::test('pages::system.online-payments')->instance()->gatewayCards)->firstWhere('key', 'paytm');
+
+    expect($stripe['currencies'])->toBe(__(':count currencies', ['count' => count(StripeGateway::currencies())]))
+        ->and($stripe['currencyList'])->toContain('INR, ')
+        ->and($paytm['currencies'])->toBe('INR')
+        ->and($paytm['currencyList'])->toBeNull();
+});
